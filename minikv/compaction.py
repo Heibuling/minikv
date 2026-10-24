@@ -17,25 +17,29 @@ next open().
 from __future__ import annotations
 
 import heapq
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 
-from .memtable import TOMBSTONE
+from .memtable import Value, _Tombstone
 from .segment import SegmentReader, write_segment
 
 
 def merge_segments(
-    readers: list[SegmentReader],
+    readers: Sequence[SegmentReader],
     output_path: str,
     block_bytes: int = 4096,
 ) -> int:
-    """Merge 'readers' (newest first) into 'output_path'; returns entry count."""
+    """Merge 'readers' (newest first) into 'output_path'; returns entry count.
+
+    Takes a Sequence so the caller can hand over an immutable tuple -- the
+    store's live segment list -- without copying it.
+    """
     expected = sum(reader.num_entries for reader in readers)
     return write_segment(output_path, _merged(readers), expected, block_bytes)
 
 
-def _merged(readers: list[SegmentReader]) -> Iterator[tuple[bytes, object]]:
+def _merged(readers: Sequence[SegmentReader]) -> Iterator[tuple[bytes, Value]]:
     sources = [reader.items() for reader in readers]
-    heap: list[tuple[bytes, int, object]] = []
+    heap: list[tuple[bytes, int, Value]] = []
 
     def advance(index: int) -> None:
         try:
@@ -49,12 +53,12 @@ def _merged(readers: list[SegmentReader]) -> Iterator[tuple[bytes, object]]:
 
     while heap:
         key = heap[0][0]
-        group: list[tuple[int, object]] = []
+        group: list[tuple[int, Value]] = []
         while heap and heap[0][0] == key:
             _, index, value = heapq.heappop(heap)
             group.append((index, value))
             advance(index)
         winner = min(group, key=lambda item: item[0])[1]
-        if winner is TOMBSTONE:
+        if isinstance(winner, _Tombstone):
             continue
         yield key, winner

@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import threading
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
 from .encoding import (
@@ -208,7 +208,7 @@ class IntervalSyncer:
     when the memtable fills; the timer must follow the active generation.
     """
 
-    def __init__(self, sync_fn, interval_ms: int = 100) -> None:
+    def __init__(self, sync_fn: Callable[[], None], interval_ms: int = 100) -> None:
         self._sync = sync_fn
         self._interval = max(interval_ms, 1) / 1000.0
         self._stop = threading.Event()

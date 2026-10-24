@@ -50,6 +50,7 @@ from __future__ import annotations
 import struct
 import zlib
 from collections.abc import Iterable
+from typing import Union
 
 from .errors import CorruptRecordError, IncompleteRecordError
 
@@ -87,8 +88,12 @@ SST_FOOTER_SIZE = SST_FOOTER.size            # 56
 
 BLOOM_HEAD = struct.Struct("<III")           # bit_size, num_hashes, nbytes
 
+#: Anything zlib.crc32 and struct.unpack_from accept.  Union rather than
+#: the PEP 604 spelling because this alias is evaluated at run time.
+Buffer = Union[bytes, bytearray, memoryview]
 
-def crc32(data, seed: int = 0) -> int:
+
+def crc32(data: Buffer, seed: int = 0) -> int:
     """CRC32 as a positive 32-bit integer (zlib returns a signed value)."""
     return zlib.crc32(data, seed) & UINT32_MAX
 
@@ -133,7 +138,7 @@ def encode_wal_record(rec_type: int, key: bytes = b"", value: bytes = b"") -> by
     return WAL_CRC.pack(crc32(body)) + body
 
 
-def decode_wal_record(buf, offset: int, limit: int | None = None) -> tuple[int, bytes, bytes, int]:
+def decode_wal_record(buf: Buffer, offset: int, limit: int | None = None) -> tuple[int, bytes, bytes, int]:
     """Decode the record at 'offset'.
 
     Returns (type, key, value, next_offset).  Raises IncompleteRecordError
@@ -203,7 +208,7 @@ def encode_sst_record(key: bytes, value: bytes, tombstone: bool) -> bytes:
     return head + key + value
 
 
-def decode_sst_record(buf, offset: int, limit: int) -> tuple[bytes, bytes, bool, int]:
+def decode_sst_record(buf: Buffer, offset: int, limit: int) -> tuple[bytes, bytes, bool, int]:
     """Decode the SSTable record at 'offset'; 'limit' bounds the block."""
     if offset + SST_RECORD_HEAD.size > limit:
         raise CorruptRecordError("truncated SSTable record header")

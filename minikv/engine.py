@@ -54,7 +54,8 @@ import os
 import threading
 import warnings
 from collections.abc import Iterator
-from typing import NamedTuple
+from types import TracebackType
+from typing import NamedTuple, TypedDict
 
 from .compaction import merge_segments
 from .encoding import (
@@ -66,13 +67,41 @@ from .encoding import (
 )
 from .errors import ClosedStoreError, CorruptRecordError, StoreLockedError
 from .faults import fault_point
-from .memtable import TOMBSTONE, MemTable
+from .memtable import TOMBSTONE, MemTable, Value, _Tombstone
 from .segment import DEFAULT_BLOCK_BYTES, BlockCache, SegmentReader, fsync_dir, write_segment
 from .wal import SYNC_MODES, WAL, IntervalSyncer, ReplayResult, warn_corruption
 
 MANIFEST_NAME = "MANIFEST"
 MANIFEST_MAGIC = "minikv-manifest-v2"
 LOCK_NAME = "LOCK"
+
+
+class SegmentCheck(TypedDict, total=False):
+    """One line of a verify() report for a segment."""
+
+    name: str
+    ok: bool
+    entries: int
+    error: str
+
+
+class WalCheck(TypedDict):
+    """One line of a verify() report for a WAL file."""
+
+    name: str
+    ok: bool
+    problem: str | None
+    records: int
+    bytes: int
+
+
+class VerifyReport(TypedDict):
+    """What Store.verify() returns: every finding, not just the first."""
+
+    ok: bool
+    segments: list[SegmentCheck]
+    wal_files: list[WalCheck]
+    errors: list[str]
 
 
 class Snapshot(NamedTuple):
@@ -107,7 +136,9 @@ class _DirectoryLock:
             else:
                 import fcntl
 
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # typeshed's fcntl stub has no locking attributes on this
+                # platform; the branch only runs on POSIX.
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
         except OSError as exc:
             os.close(fd)
             raise StoreLockedError(
@@ -135,7 +166,7 @@ class _DirectoryLock:
             else:
                 import fcntl
 
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
         except OSError:  # pragma: no cover - unlock failures are not fatal
             pass
         finally:
@@ -375,7 +406,7 @@ class Store:
     @staticmethod
     def _memtable_items(
         operations: Iterator[tuple[int, bytes, bytes]],
-    ) -> Iterator[tuple[bytes, object]]:
+    ) -> Iterator[tuple[bytes, Value]]:
         for rec_type, key, value in operations:
             if rec_type == WAL_TYPE_PUT:
                 yield key, value
@@ -494,11 +525,15 @@ class Store:
     def _get_from(view: Snapshot, key: bytes, default: bytes | None) -> bytes | None:
         value = view.memtable.get(key)
         if value is not None:
-            return default if value is TOMBSTONE else value  # type: ignore[return-value]
+            if isinstance(value, _Tombstone):
+                return default
+            return value
         for segment in view.segments:
             value = segment.get(key)
             if value is not None:
-                return default if value is TOMBSTONE else value  # type: ignore[return-value]
+                if isinstance(value, _Tombstone):
+                    return default
+                return value
         return default
 
     def scan(
@@ -565,8 +600,10 @@ class Store:
             yield item
 
     @staticmethod
-    def _merge_sources(sources: list[Iterator[tuple[bytes, object]]]) -> Iterator[tuple[bytes, bytes]]:
-        heap: list[tuple[bytes, int, object]] = []
+    def _merge_sources(
+        sources: list[Iterator[tuple[bytes, Value]]],
+    ) -> Iterator[tuple[bytes, bytes]]:
+        heap: list[tuple[bytes, int, Value]] = []
 
         def advance(index: int) -> None:
             try:
@@ -580,46 +617,48 @@ class Store:
 
         while heap:
             key = heap[0][0]
-            group: list[tuple[int, object]] = []
+            group: list[tuple[int, Value]] = []
             while heap and heap[0][0] == key:
                 _, index, value = heapq.heappop(heap)
                 group.append((index, value))
                 advance(index)
             winner = min(group, key=lambda item: item[0])[1]
-            if winner is TOMBSTONE:
+            if isinstance(winner, _Tombstone):
                 continue
-            yield key, winner  # type: ignore[misc]
+            yield key, winner
 
     @staticmethod
-    def _merge_sources_desc(sources: list[Iterator[tuple[bytes, object]]]) -> Iterator[tuple[bytes, bytes]]:
+    def _merge_sources_desc(
+        sources: list[Iterator[tuple[bytes, Value]]],
+    ) -> Iterator[tuple[bytes, bytes]]:
         """Descending merge of already-descending sources (newest wins)."""
-        heads: list[list] = []
+        heads: list[tuple[int, bytes, Value]] = []
         for index, source in enumerate(sources):
             try:
                 key, value = next(source)
             except StopIteration:
                 continue
-            heads.append([index, key, value])
+            heads.append((index, key, value))
 
         while heads:
             highest = max(head[1] for head in heads)
             winner_index = -1
-            winner_value: object = None
-            remaining: list[list] = []
+            winner_value: Value | None = None
+            remaining: list[tuple[int, bytes, Value]] = []
             for index, key, value in heads:
                 if key == highest:
                     if winner_index < 0 or index < winner_index:
                         winner_index, winner_value = index, value
                     try:
                         next_key, next_value = next(sources[index])
-                        remaining.append([index, next_key, next_value])
+                        remaining.append((index, next_key, next_value))
                     except StopIteration:
                         pass
                 else:
-                    remaining.append([index, key, value])
+                    remaining.append((index, key, value))
             heads = remaining
-            if winner_value is not TOMBSTONE:
-                yield highest, winner_value  # type: ignore[misc]
+            if winner_value is not None and not isinstance(winner_value, _Tombstone):
+                yield highest, winner_value
 
     # -- maintenance -----------------------------------------------------
 
@@ -741,7 +780,7 @@ class Store:
         finally:
             self._compact_lock.release()
 
-    def verify(self) -> dict[str, object]:
+    def verify(self) -> VerifyReport:
         """Read back every block of every segment and every WAL.
 
         This is the full scrub the lazy read path deliberately avoids: it
@@ -755,10 +794,9 @@ class Store:
         finally:
             self._release_snapshot()
 
-    def _verify_view(self, view: Snapshot) -> dict[str, object]:
-        report: dict[str, object] = {"ok": True, "segments": [], "wal_files": [], "errors": []}
-        segments_report: list[dict] = []
-        wal_report: list[dict] = []
+    def _verify_view(self, view: Snapshot) -> VerifyReport:
+        segments_report: list[SegmentCheck] = []
+        wal_report: list[WalCheck] = []
         errors: list[str] = []
 
         for segment in view.segments:
@@ -788,11 +826,12 @@ class Store:
             segments_report.append(
                 {"name": "memtable (pending flush)", "ok": True, "entries": len(self._pending)}
             )
-        report["segments"] = segments_report
-        report["wal_files"] = wal_report
-        report["errors"] = errors
-        report["ok"] = not errors
-        return report
+        return {
+            "ok": not errors,
+            "segments": segments_report,
+            "wal_files": wal_report,
+            "errors": errors,
+        }
 
     def stats(self) -> dict[str, object]:
         self._check_open()
@@ -851,7 +890,12 @@ class Store:
     def __enter__(self) -> Store:
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
 
@@ -917,7 +961,12 @@ class StoreSnapshot:
         self._check_usable()
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def __del__(self) -> None:
@@ -955,7 +1004,12 @@ class _Batch:
         if not self._active:
             raise RuntimeError("batch is not active; use 'with store.batch() as b'")
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self._active = False
         if exc_type is None:
             self._store._commit_batch(self._ops)

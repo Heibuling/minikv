@@ -3,6 +3,43 @@
 All notable changes to this project are documented here.  The format
 follows Keep a Changelog.
 
+## [1.5.0] - 2026-10-24
+
+The library now passes mypy --strict.  No behaviour changed and no API
+was removed.
+
+### Added
+
+- **Strict type checking in CI** (mypy --strict, configured in
+  pyproject.toml and applied to the package only); mypy joined the dev
+  dependencies.
+- **Value = bytes | Tombstone** as the real type of a stored entry, and
+  **Buffer = bytes | bytearray | memoryview** for what a checksum or a
+  struct unpack accepts.  Both are typing.Union aliases, because they are
+  evaluated at run time and the package still supports Python 3.9.
+- **TypedDicts for the verify() report** (VerifyReport, SegmentCheck,
+  WalCheck), so the fsck command's use of that report is checked rather
+  than relying on object.
+
+### Changed
+
+- "Absent from the memtable" is spelled None instead of a private
+  sentinel.  A Value is never None, so the sentinel was redundant -- and
+  None is the one thing the checker narrows reliably.
+- Readers narrow with isinstance(value, _Tombstone); comparing against
+  the singleton works at run time and tells mypy nothing.
+- merge_segments takes a Sequence, so the store hands over its live
+  segment tuple without copying it.
+- 124 tests, coverage 90.3%; ruff, mypy and pytest all clean.
+
+### Notes
+
+- mypy 2.x cannot analyse a 3.9 target, so the checker runs with
+  python_version = "3.10".  Python 3.9 support is enforced by the CI
+  matrix, which installs and runs the suite there; the checker's job is
+  soundness, not syntax-version gating.  The setting says so next to
+  itself in pyproject.toml.
+
 ## [1.4.0] - 2026-10-24
 
 Additive release: restart is 1.35x faster and no longer replays records

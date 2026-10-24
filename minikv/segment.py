@@ -28,6 +28,7 @@ import struct
 import threading
 from collections import OrderedDict
 from collections.abc import Iterator
+from typing import BinaryIO
 
 from .encoding import (
     BLOOM_HEAD,
@@ -44,12 +45,18 @@ from .encoding import (
 )
 from .errors import ClosedStoreError, CorruptRecordError
 from .faults import fault_point
-from .memtable import TOMBSTONE
+from .memtable import TOMBSTONE, Value, _Tombstone
 
 DEFAULT_BLOCK_BYTES = 4096
 DEFAULT_BITS_PER_KEY = 10
 
 IndexEntry = tuple[bytes, int, int, int]  # first_key, offset, length, crc
+
+#: A decoded data block: its keys, and its (key, value) entries.  Cached so a
+#: second lookup in the same block is a bisect rather than a decode.
+DecodedBlock = tuple[tuple[bytes, ...], tuple[tuple[bytes, Value], ...]]
+CacheEntry = tuple[tuple[bytes, ...], tuple[tuple[bytes, Value], ...], int]
+CacheKey = tuple[str, int]
 
 
 def fsync_dir(path: str) -> bool:
@@ -91,14 +98,14 @@ class BlockCache:
     def __init__(self, max_bytes: int = 0) -> None:
         self.max_bytes = max(0, int(max_bytes))
         self._lock = threading.Lock()
-        self._entries: OrderedDict = OrderedDict()
+        self._entries: OrderedDict[CacheKey, CacheEntry] = OrderedDict()
         self._used = 0
 
     @property
     def enabled(self) -> bool:
         return self.max_bytes > 0
 
-    def get(self, cache_key):
+    def get(self, cache_key: CacheKey) -> CacheEntry | None:
         if not self.enabled:
             return None
         with self._lock:
@@ -107,7 +114,13 @@ class BlockCache:
                 self._entries.move_to_end(cache_key)
             return entry
 
-    def put(self, cache_key, keys, entries, size: int) -> None:
+    def put(
+        self,
+        cache_key: CacheKey,
+        keys: tuple[bytes, ...],
+        entries: tuple[tuple[bytes, Value], ...],
+        size: int,
+    ) -> None:
         if not self.enabled:
             return
         with self._lock:
@@ -193,7 +206,7 @@ class _Bloom:
 
 def write_segment(
     path: str,
-    items: Iterator[tuple[bytes, object]],
+    items: Iterator[tuple[bytes, Value]],
     expected_entries: int,
     block_bytes: int = DEFAULT_BLOCK_BYTES,
     bits_per_key: int = DEFAULT_BITS_PER_KEY,
@@ -228,13 +241,18 @@ def write_segment(
     try:
         with open(tmp_path, "wb") as handle:
             for key, value in items:
-                tombstone = value is TOMBSTONE
                 if block_first is None:
                     block_first = key
                 if first_key is None:
                     first_key = key
                 last_key = key
-                buffer += encode_sst_record(key, b"" if tombstone else value, tombstone)  # type: ignore[arg-type]
+                # Branched rather than assigned to a flag: isinstance() is what
+                # narrows Value to bytes, and a bool would not.
+                if isinstance(value, _Tombstone):
+                    buffer += encode_sst_record(key, b"", True)
+                else:
+                    buffer += encode_sst_record(key, value, False)
+
                 bloom.add(key)
                 count += 1
                 if len(buffer) >= block_bytes:
@@ -336,7 +354,7 @@ class SegmentReader:
         #: Set by the store when the segment is created or loaded; 0 means
         #: "unknown", which makes recovery replay everything (always safe).
         self.wal_seq = 0
-        self._handle = None
+        self._handle: BinaryIO | None = None
         self._io_lock = threading.Lock()
         self._closed = False
 
@@ -384,7 +402,7 @@ class SegmentReader:
 
     # -- block access ----------------------------------------------------
 
-    def _read_block(self, handle, position: int) -> bytes:
+    def _read_block(self, handle: BinaryIO, position: int) -> bytes:
         _, offset, length, crc = self._index[position]
         handle.seek(offset)
         data = handle.read(length)
@@ -397,14 +415,14 @@ class SegmentReader:
     def _block_for(self, key: bytes) -> int:
         return max(bisect.bisect_right(self._keys, key) - 1, 0)
 
-    def _cached_handle(self):
+    def _cached_handle(self) -> BinaryIO:
         if self._closed:
             raise ClosedStoreError(f"segment {self.name} was closed with its store")
         if self._handle is None:
             self._handle = open(self.path, "rb")  # noqa: SIM115 - closed by close()
         return self._handle
 
-    def _block_entries(self, position: int) -> tuple[tuple[bytes, ...], tuple[tuple[bytes, object], ...]]:
+    def _block_entries(self, position: int) -> DecodedBlock:
         """Decoded, verified entries of one block, through the cache."""
         cache_key = (self.path, position)
         if self._cache is not None:
@@ -418,18 +436,21 @@ class SegmentReader:
         return keys, entries
 
     @staticmethod
-    def _decode_block(data: bytes) -> tuple[tuple[bytes, ...], tuple[tuple[bytes, object], ...]]:
+    def _decode_block(data: bytes) -> DecodedBlock:
         """Decode every record of one verified block."""
-        decoded: list[tuple[bytes, object]] = []
+        decoded: list[tuple[bytes, Value]] = []
         offset = 0
         end = len(data)
         while offset < end:
-            record_key, value, tombstone, offset = decode_sst_record(data, offset, end)
-            decoded.append((record_key, TOMBSTONE if tombstone else value))
-        entries: tuple[tuple[bytes, object], ...] = tuple(decoded)
+            record_key, record_value, tombstone, offset = decode_sst_record(data, offset, end)
+            if tombstone:
+                decoded.append((record_key, TOMBSTONE))
+            else:
+                decoded.append((record_key, record_value))
+        entries: tuple[tuple[bytes, Value], ...] = tuple(decoded)
         return tuple(key for key, _ in entries), entries
 
-    def _block_entries_uncached(self, position: int):
+    def _block_entries_uncached(self, position: int) -> DecodedBlock:
         """Read and verify a block without consulting the cache.
 
         Anything that must inspect the bytes on disk -- verify(), fsck --
@@ -441,7 +462,7 @@ class SegmentReader:
 
     # -- public reads ----------------------------------------------------
 
-    def get(self, key: bytes) -> object:
+    def get(self, key: bytes) -> Value | None:
         """Return bytes, TOMBSTONE, or None (definitely absent)."""
         if not self._index or not self.overlaps(key, key):
             return None
@@ -490,12 +511,13 @@ class SegmentReader:
         return None
 
     @staticmethod
-    def _block_size(entries: tuple[tuple[bytes, object], ...]) -> int:
+    def _block_size(entries: tuple[tuple[bytes, Value], ...]) -> int:
         return sum(
-            len(key) + (0 if value is TOMBSTONE else len(value)) + 32 for key, value in entries
+            len(key) + (0 if isinstance(value, _Tombstone) else len(value)) + 32
+            for key, value in entries
         )
 
-    def scan(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
+    def scan(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, Value]]:
         """Yield start <= key <= end in ascending order."""
         if not self.overlaps(start, end):
             return
@@ -511,7 +533,7 @@ class SegmentReader:
                     yield key, value
             position += 1
 
-    def scan_backward(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
+    def scan_backward(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, Value]]:
         """Yield start <= key <= end in descending order.
 
         A block is decoded forward into a small list (bounded by the block
@@ -534,7 +556,7 @@ class SegmentReader:
                 yield key, value
             position -= 1
 
-    def items(self) -> Iterator[tuple[bytes, object]]:
+    def items(self) -> Iterator[tuple[bytes, Value]]:
         """Yield every entry in ascending key order.
 
         Deliberately bypasses the block cache: this is a full sequential

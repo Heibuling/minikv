@@ -7,13 +7,20 @@ about evidence, not ceremony.
 ## Before you send a change
 
 ```
-python -m pip install pytest pytest-cov hypothesis ruff
+python -m pip install pytest pytest-cov hypothesis mypy ruff
 ruff check .
+mypy                         # strict; configured in pyproject.toml
 pytest --cov=minikv          # the coverage floor (85%) is in pyproject.toml
 ```
 
-CI runs the same two commands on Linux, macOS and Windows for Python 3.9,
-3.12 and 3.13.  A change that only passes on one of them is not done.
+CI runs the same three commands on Linux, macOS and Windows for Python
+3.9, 3.12 and 3.13.  A change that only passes on one of them is not done.
+
+**The library is strictly typed; tests and benchmarks are not checked.**
+The package must pass `mypy --strict`, which is why a stored entry is
+modelled as `Value = bytes | Tombstone` rather than `object`, and why a
+reader narrows with `isinstance` instead of comparing against the
+sentinel: only the former tells the checker anything.
 
 ## What a change needs to include
 

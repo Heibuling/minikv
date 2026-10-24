@@ -5,6 +5,11 @@ recent deletes.  Values are plain bytes; a module-level sentinel marks a
 deleted key so the tombstone can shadow an older value that still lives
 in an SSTable.
 
+The type of a stored entry is Value -- bytes or a tombstone -- and None
+means "this key is not here", which is unambiguous because neither a
+value nor a tombstone is ever None.  Readers narrow with isinstance; the
+engine relies on that narrowing to keep tombstones out of query results.
+
 Ordering
 --------
 
@@ -27,8 +32,7 @@ from __future__ import annotations
 import bisect
 import threading
 from collections.abc import Iterable, Iterator
-
-_ABSENT = object()
+from typing import Union
 
 
 class _Tombstone:
@@ -47,12 +51,15 @@ class _Tombstone:
 
 TOMBSTONE = _Tombstone()
 
-Value = object  # bytes or TOMBSTONE; spelled out for readability
+#: What a memtable or a segment can hold for a key.  Union rather than the
+#: PEP 604 spelling because this alias is evaluated at run time and the
+#: package still supports Python 3.9.
+Value = Union[bytes, _Tombstone]
 
 
-def entry_size(key: bytes, value: object) -> int:
+def entry_size(key: bytes, value: Value) -> int:
     """Approximate memory cost of one entry, used for the flush threshold."""
-    payload = 0 if value is TOMBSTONE else len(value)  # type: ignore[arg-type]
+    payload = 0 if isinstance(value, _Tombstone) else len(value)
     return len(key) + payload + 16
 
 
@@ -60,7 +67,7 @@ class MemTable:
     """Sorted-by-key in-memory buffer with tombstones."""
 
     def __init__(self) -> None:
-        self._data: dict[bytes, object] = {}
+        self._data: dict[bytes, Value] = {}
         self._bytes = 0
         self._keys: list[bytes] | None = None
         self._lock = threading.Lock()
@@ -69,9 +76,9 @@ class MemTable:
 
     def put(self, key: bytes, value: bytes) -> None:
         with self._lock:
-            old = self._data.get(key, _ABSENT)
+            old = self._data.get(key)
             self._data[key] = value
-            if old is _ABSENT:
+            if old is None:
                 self._bytes += entry_size(key, value)
                 self._keys = None
             else:
@@ -79,15 +86,15 @@ class MemTable:
 
     def delete(self, key: bytes) -> None:
         with self._lock:
-            old = self._data.get(key, _ABSENT)
+            old = self._data.get(key)
             self._data[key] = TOMBSTONE
-            if old is _ABSENT:
+            if old is None:
                 self._bytes += entry_size(key, TOMBSTONE)
                 self._keys = None
             else:
                 self._bytes += entry_size(key, TOMBSTONE) - entry_size(key, old)
 
-    def load(self, items: Iterable[tuple[bytes, object]]) -> None:
+    def load(self, items: Iterable[tuple[bytes, Value]]) -> None:
         """Insert many entries at once, for recovery only.
 
         Recovery is single-threaded -- the store holds the directory lock
@@ -99,13 +106,13 @@ class MemTable:
         data = self._data
         added = 0
         for key, value in items:
-            old = data.get(key, _ABSENT)
+            old = data.get(key)
             data[key] = value
-            payload = 0 if value is TOMBSTONE else len(value)  # type: ignore[arg-type]
-            if old is _ABSENT:
+            payload = 0 if isinstance(value, _Tombstone) else len(value)
+            if old is None:
                 added += len(key) + payload + 16
             else:
-                old_payload = 0 if old is TOMBSTONE else len(old)  # type: ignore[arg-type]
+                old_payload = 0 if isinstance(old, _Tombstone) else len(old)
                 added += payload - old_payload
         with self._lock:
             self._bytes += added
@@ -119,10 +126,9 @@ class MemTable:
 
     # -- reads -----------------------------------------------------------
 
-    def get(self, key: bytes) -> object:
-        """Return bytes, TOMBSTONE, or None when the key is absent here."""
-        value = self._data.get(key, _ABSENT)
-        return None if value is _ABSENT else value
+    def get(self, key: bytes) -> Value | None:
+        """Return the stored value, a tombstone, or None when absent."""
+        return self._data.get(key)
 
     def __len__(self) -> int:
         return len(self._data)
@@ -145,16 +151,16 @@ class MemTable:
                     self._keys = keys
         return keys
 
-    def items_sorted(self) -> Iterator[tuple[bytes, object]]:
+    def items_sorted(self) -> Iterator[tuple[bytes, Value]]:
         """Yield (key, value-or-TOMBSTONE) in ascending key order."""
         keys = self.sorted_keys()
         data = self._data
         for key in keys:
-            value = data.get(key, _ABSENT)
-            if value is not _ABSENT:
+            value = data.get(key)
+            if value is not None:
                 yield key, value
 
-    def scan(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
+    def scan(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, Value]]:
         """Yield entries with start <= key <= end (end=None means unbounded)."""
         keys = self.sorted_keys()
         lo = bisect.bisect_left(keys, start)
@@ -162,11 +168,11 @@ class MemTable:
         data = self._data
         for index in range(lo, hi):
             key = keys[index]
-            value = data.get(key, _ABSENT)
-            if value is not _ABSENT:
+            value = data.get(key)
+            if value is not None:
                 yield key, value
 
-    def scan_backward(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
+    def scan_backward(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, Value]]:
         """Yield entries with start <= key <= end, highest key first."""
         keys = self.sorted_keys()
         lo = bisect.bisect_left(keys, start)
@@ -174,6 +180,6 @@ class MemTable:
         data = self._data
         for index in range(hi - 1, lo - 1, -1):
             key = keys[index]
-            value = data.get(key, _ABSENT)
-            if value is not _ABSENT:
+            value = data.get(key)
+            if value is not None:
                 yield key, value

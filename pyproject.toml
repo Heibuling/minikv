@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minikv"
-version = "1.4.0"
+version = "1.5.0"
 description = "A small, auditable LSM-style embedded key-value store (standard library only)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -24,7 +24,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.5", "hypothesis>=6"]
+dev = ["pytest>=7", "pytest-cov>=4", "ruff>=0.5", "hypothesis>=6", "mypy>=1.8"]
 
 [project.scripts]
 minikv = "minikv.cli:main"
@@ -42,10 +42,22 @@ source = ["minikv"]
 branch = true
 
 [tool.coverage.report]
-# Measured at 89% on the development machine.  The floor only guards
+# Measured at 90% on the development machine.  The floor only guards
 # against a change that adds code without tests; it is not a target.
 fail_under = 85
 exclude_lines = ["if TYPE_CHECKING:", "pragma: no cover", "raise NotImplementedError"]
+
+[tool.mypy]
+# mypy 2.x cannot analyse a 3.9 target, so the checker runs at the lowest
+# version it supports.  Python 3.9 compatibility is enforced by the CI
+# matrix, which really does install and run the suite there -- the type
+# checker's job here is soundness, not syntax-version gating.  The library
+# is checked strictly; tests and benchmarks are not checked at all.
+python_version = "3.10"
+files = ["minikv"]
+strict = true
+show_error_codes = true
+warn_unused_ignores = true
 
 [tool.ruff]
 line-length = 110

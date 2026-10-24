@@ -17,7 +17,7 @@ from .engine import Store
 from .wal import SYNC_MODES
 
 
-def _store(args) -> Store:
+def _store(args: argparse.Namespace) -> Store:
     return Store(
         args.db,
         sync=args.sync,
@@ -25,13 +25,13 @@ def _store(args) -> Store:
     )
 
 
-def cmd_put(args) -> int:
+def cmd_put(args: argparse.Namespace) -> int:
     with _store(args) as store:
         store.put(args.key.encode("utf-8"), args.value.encode("utf-8"))
     return 0
 
 
-def cmd_get(args) -> int:
+def cmd_get(args: argparse.Namespace) -> int:
     with _store(args) as store:
         value = store.get(args.key.encode("utf-8"))
     if value is None:
@@ -43,13 +43,13 @@ def cmd_get(args) -> int:
     return 0
 
 
-def cmd_del(args) -> int:
+def cmd_del(args: argparse.Namespace) -> int:
     with _store(args) as store:
         store.delete(args.key.encode("utf-8"))
     return 0
 
 
-def cmd_scan(args) -> int:
+def cmd_scan(args: argparse.Namespace) -> int:
     start = args.start.encode("utf-8")
     end = args.end.encode("utf-8") if args.end is not None else None
     with _store(args) as store:
@@ -58,7 +58,7 @@ def cmd_scan(args) -> int:
     return 0
 
 
-def cmd_stats(args) -> int:
+def cmd_stats(args: argparse.Namespace) -> int:
     with _store(args) as store:
         stats = store.stats()
     for name, value in stats.items():
@@ -66,7 +66,7 @@ def cmd_stats(args) -> int:
     return 0
 
 
-def cmd_compact(args) -> int:
+def cmd_compact(args: argparse.Namespace) -> int:
     with _store(args) as store:
         result = store.compact()
     print(
@@ -76,7 +76,7 @@ def cmd_compact(args) -> int:
     return 0
 
 
-def cmd_fsck(args) -> int:
+def cmd_fsck(args: argparse.Namespace) -> int:
     """Read back every block of every segment and every WAL record."""
     with _store(args) as store:
         report = store.verify()
@@ -85,11 +85,17 @@ def cmd_fsck(args) -> int:
             print(f"segment {entry['name']}: ok ({entry.get('entries', 0)} entries)")
         else:
             print(f"segment {entry['name']}: FAILED {entry.get('error')}")
-    for entry in report["wal_files"]:
-        if entry["ok"]:
-            print(f"{entry['name']}: ok ({entry['records']} records, {entry['bytes']} bytes)")
+    for wal_entry in report["wal_files"]:
+        if wal_entry["ok"]:
+            print(
+                f"{wal_entry['name']}: ok "
+                f"({wal_entry['records']} records, {wal_entry['bytes']} bytes)"
+            )
         else:
-            print(f"{entry['name']}: {entry['problem']} record after {entry['bytes']} bytes")
+            print(
+                f"{wal_entry['name']}: {wal_entry['problem']} record "
+                f"after {wal_entry['bytes']} bytes"
+            )
     if report["ok"]:
         print("fsck: no problems found")
         return 0
@@ -97,7 +103,7 @@ def cmd_fsck(args) -> int:
     return 1
 
 
-def cmd_bench(args) -> int:
+def cmd_bench(args: argparse.Namespace) -> int:
     """A deliberately small in-process benchmark; see benchmarks/bench.py."""
     count = args.count
     payload = b"v" * args.value_size
@@ -166,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv=None) -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

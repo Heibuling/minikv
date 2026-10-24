@@ -111,10 +111,10 @@ checkpoints the WAL, taking restart from 0.008 s to 0.004 s.
 ## Development
 
 ```
-python -m pip install pytest pytest-cov hypothesis ruff
-ruff check .
-pytest --cov=minikv        # coverage floor is 85% (pyproject.toml)
+python -m pip install pytest pytest-cov hypothesis mypy ruff
+ruff check . && mypy       # both strict; configured in pyproject.toml
+pytest --cov=minikv        # coverage floor is 85%
 ```
 
-CI runs ruff, the suite and the coverage floor on Linux, macOS and Windows
-for Python 3.9, 3.12 and 3.13.  MIT licensed.
+CI runs ruff, mypy, the suite and the coverage floor on Linux, macOS and
+Windows for Python 3.9, 3.12 and 3.13.  MIT licensed.
