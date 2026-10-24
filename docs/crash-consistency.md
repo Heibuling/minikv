@@ -51,10 +51,13 @@ Enforced in `engine.Store._drain_flushes`; tested by the flush-crossing
 kill points.
 
 **I5 -- A segment file is deleted only when no snapshot can reference it.**
-Compaction retires its inputs instead of unlinking them; they are removed
-in `close()`, or by the next `open()`, which deletes every segment the
-MANIFEST does not list.
-Enforced in `engine.Store.compact/close/_load_segments`.
+Compaction retires its inputs instead of unlinking them.  Each read holds
+a lease (implicitly for one `get()` or scan, explicitly via
+`Store.snapshot()`); when the last lease goes, the retired files are
+unlinked and their handles closed.  Anything left over is removed by the
+next `open()`, which deletes every segment the MANIFEST does not list.
+Enforced in `engine.Store._acquire_snapshot/_release_snapshot/_reclaim`;
+tested in `test_compaction.py`.
 
 **I6 -- No unverified bytes are returned.** Decoded data always passed a
 CRC32 first: WAL records before replay, segment blocks before decoding,
@@ -108,7 +111,41 @@ the store, and checks that keys 0..kill_at are all present and correct.
 - 20 kill points with a 1 KiB memtable, which forces a flush every few
   writes and therefore lands kills during and around flush bookkeeping.
 
-### 4.2 External kills
+### 4.2 Named flush steps
+
+A flush walks a fixed protocol (build the temporary file, fsync it, rename
+it, fsync the directory, update the manifest, fsync it, delete the WAL it
+replaced).  Each step is a named fault point in `minikv/faults.py`:
+
+    segment_tmp_written   the .tmp file exists and is durable, not renamed
+    segment_renamed       the segment is in place, the manifest is not
+    manifest_before       as above, immediately before the manifest write
+    manifest_after        the manifest lists it, the old WAL still exists
+    wal_before_delete     as above, immediately before the unlink
+    wal_after_delete      the flush completed
+    compaction_merged     the merged file exists, the manifest is old
+    compaction_manifest   the manifest is updated, the inputs are retired
+
+Setting `MINIKV_FAULT=<name>` makes the process call `os._exit(9)` when it
+reaches that point; `MINIKV_FAULT=<name>:2` fires on the second visit, and
+`MINIKV_FAULT_ACTION=raise` raises `InjectedFault` instead so a test can
+stay in-process.  A name that is not in the list can never fire, so
+`faults.unknown_points()` exists to catch a typo.
+
+For each of the six flush points the suite starts a child that writes with
+`sync="always"` and prints every index as soon as its `put()` returns, so
+the parent knows exactly which writes were acknowledged.  It then asserts
+that
+
+- every acknowledged write is present with the right value,
+- `verify()` reports no damage,
+- a new write succeeds after recovery,
+- and a reopen sees that new write.
+
+In other words, the ordering claimed in docs/format.md is exercised at
+every boundary rather than at one convenient moment.
+
+### 4.3 External kills
 
 The child writes in a loop; the parent calls `kill()` after a random delay
 between 150 and 500 ms, eight times. After each kill the store is reopened
@@ -116,7 +153,7 @@ and every key that exists must be correct, and the keys after the first
 gap must be absent -- writes are sequential, so a surviving set that is
 not a prefix would indicate a torn record was decoded.
 
-### 4.3 Damage injection
+### 4.4 Damage injection
 
 Corruption tests mutate real files in a real temporary directory; nothing
 is mocked:

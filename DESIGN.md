@@ -165,6 +165,13 @@ The engine still never returns wrong data; it may lose records after the
 damage, which is why corruption is reported on `stats()` and in a
 warning.
 
+Every step of the flush protocol is independently injectable.  Setting
+`MINIKV_FAULT` to a step name aborts the process at that exact point, and
+the crash suite asserts that each acknowledged write survives, that the
+store reopens, that `verify()` is clean and that writes still work
+afterwards.  That is what turns the ordering above from a claim into
+evidence -- see docs/crash-consistency.md.
+
 ## 6. Concurrency model
 
 Single writer, many readers.
@@ -182,8 +189,12 @@ Single writer, many readers.
 - When a flush starts, the writer swaps in a fresh memtable and publishes
   a snapshot containing the frozen one. A reader that grabbed the old
   snapshot keeps iterating the old memtable and the old segment list.
-- Segments are immutable, so a snapshot's segment list stays valid. Their
-  files stay on disk until `close()` for exactly that reason.
+- Segments are immutable, so a snapshot's segment list stays valid.  A
+  segment that compaction retires stays on disk, and readable, until no
+  snapshot can reach it; then its file is unlinked and its handle closed.
+  Every read holds a lease for the duration of one `get()` or one scan,
+  and `Store.snapshot()` hands that lease to a caller whose read spans
+  many operations.
 
 The visible consequence: read-your-writes holds within a thread because
 the memtable is shared; a reader in another thread may miss a write that
@@ -227,12 +238,12 @@ recording each segment's key range, so a segment that cannot contain the
 key is rejected before its bloom filter is consulted.
 
 The cost is lifecycle complexity: on Windows a file with an open handle
-cannot be deleted, so `compact()` cannot unlink its inputs. They are
-retired into a list, stay readable for snapshots in flight, and are
-deleted in `close()`. A long-lived process that compacts repeatedly
-therefore holds one descriptor per retired segment until it closes; this
-is documented as a limitation rather than fixed with reference counting,
-which would require every snapshot iteration to register itself.
+cannot be deleted, so `compact()` cannot unlink its inputs.  They are
+retired instead, and reclaimed the moment the last snapshot referencing
+them is released -- which in the common case is immediately, because the
+store itself is the only holder of the *current* view.  A long reader
+takes a lease: implicitly around every `get()` and scan, or explicitly
+with `Store.snapshot()` when the read spans many calls.
 
 ### 7.3 Sparse index and 4 KiB blocks: 0.6% index overhead
 
@@ -296,8 +307,9 @@ written, and the documented boundaries are accepted.
   retired files stay on disk until `close()`.
 - **No group commit for concurrent writers.** `batch()` covers the single
   writer this API offers; a multi-writer design would need more.
-- **Retired segments hold a descriptor** until `close()`. A process that
-  compacts thousands of times without closing would run out of handles.
+- **A leaked snapshot holds files open.** Reclamation depends on the last
+  lease being released: a `StoreSnapshot` that is neither closed nor
+  collected keeps its segments on disk and their handles open.
 - **Reverse scans decode a block forward and then walk it backwards.** They
   stream and honour `limit`, but they are not the cheapest traversal.
 - **Recovery still reads every WAL record.** Streaming replay removed the

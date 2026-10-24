@@ -41,6 +41,7 @@ from .encoding import (
     encode_sst_record,
 )
 from .errors import ClosedStoreError, CorruptRecordError
+from .faults import fault_point
 from .memtable import TOMBSTONE
 
 DEFAULT_BLOCK_BYTES = 4096
@@ -215,8 +216,10 @@ def write_segment(
             handle.flush()
             os.fsync(handle.fileno())
 
+        fault_point("segment_tmp_written")
         os.replace(tmp_path, path)
         fsync_dir(os.path.dirname(os.path.abspath(path)))
+        fault_point("segment_renamed")
         return count
     except BaseException:
         with contextlib.suppress(OSError):

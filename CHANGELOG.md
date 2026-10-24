@@ -3,6 +3,52 @@
 All notable changes to this project are documented here.  The format
 follows Keep a Changelog.
 
+## [1.2.0] - 2026-10-24
+
+Additive release: it makes the crash-consistency claims testable at every
+boundary, fixes the one structural compromise left in the compaction
+design, and documents the on-disk format in one place.  Nothing was
+removed.
+
+### Added
+
+- **`Store.snapshot()`** and reference-counted file reclamation.
+  `get()` and `scan()` hold a short-lived lease, and a caller can hold one
+  explicitly; a segment that compaction retires is unlinked and its handle
+  closed the moment the last snapshot referencing it is released, instead
+  of accumulating until `close()`.  A `StoreSnapshot` is a read-only view
+  with `get`, `scan`, a context manager and `close()`.
+- **`Store.flush()`**: force the current memtable to a segment on demand,
+  which makes the WAL a bounded and known size before a backup.
+- **Fault injection at every flush step** (`minikv/faults.py`).  Setting
+  `MINIKV_FAULT` to `segment_tmp_written`, `segment_renamed`,
+  `manifest_before`, `manifest_after`, `wal_before_delete`,
+  `wal_after_delete`, `compaction_merged` or `compaction_manifest`
+  aborts the process at that exact point.  Six new tests kill the process
+  at each flush point and assert that every acknowledged write survives,
+  that `verify()` is clean, and that the store still works afterwards.
+- **`docs/format.md`**: every byte layout with offsets -- directory,
+  WAL record, batch payload, segment record, data block, index block,
+  bloom block, footer, manifest -- plus the write/flush ordering and a
+  walkthrough of how a value is found.
+- **`benchmarks/measure_batch.py`** now sweeps the batch size and writes a
+  JSON curve.  Under `sync="always"`: 258.50 us/op at batch 1, 7.70 at
+  batch 50 (33.6x), 2.03 at batch 500 (127x), against a 1.12 us/op floor
+  with fsync off.
+
+### Changed
+
+- Restarted segments of a compaction are reclaimed as soon as they become
+  unreachable, so a long-running process no longer accumulates descriptors
+  and disk space between closes.
+- `stats()` reports `live_snapshots` alongside `deferred_deletes`.
+- 117 tests (was 108).
+
+### Known limitations
+
+- A `StoreSnapshot` that is never closed and never collected keeps its
+  segments on disk, by design: reclamation follows the last lease.
+
 ## [1.1.0] - 2026-10-24
 
 Correctness and measurement pass over the 1.0 engine.  No API was removed.

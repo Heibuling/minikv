@@ -19,12 +19,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "writer_child.py")
 
 
-def spawn(db, mode, count, kill_at, memtable_bytes=4096, sync="always"):
+def spawn(db, mode, count, kill_at, memtable_bytes=4096, sync="always", extra_env=None):
     env = dict(os.environ)
     env["PYTHONPATH"] = PROJECT_ROOT
+    env.update(extra_env or {})
     return subprocess.Popen(
         [sys.executable, CHILD, str(db), mode, str(count), str(kill_at), str(memtable_bytes), sync],
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if mode == "flush" else subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=env,
     )
@@ -72,6 +73,63 @@ def test_kill_points_that_cross_a_memtable_flush(tmp_path):
         missing = [i for i in range(kill_at + 1) if store.get(key_of(i)) != value_of(i)]
         store.close()
         assert missing == [], f"kill point {kill_at} lost {missing[:5]}"
+
+
+FLUSH_FAULT_POINTS = (
+    "segment_tmp_written",
+    "segment_renamed",
+    "manifest_before",
+    "manifest_after",
+    "wal_before_delete",
+    "wal_after_delete",
+)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("point", FLUSH_FAULT_POINTS)
+def test_a_crash_at_any_flush_step_keeps_every_acknowledged_write(tmp_path, point):
+    """Kill the process at each step of the flush protocol, one at a time.
+
+    This is what turns the ordering claim in docs/format.md into evidence:
+    the child announces every acknowledged write on stdout, MINIKV_FAULT
+    aborts it at the named step, and the parent checks that all of those
+    writes are still there -- and that the store is not just readable but
+    still usable and internally consistent.
+    """
+    db = tmp_path / f"fault-{point}"
+    process = spawn(
+        db,
+        "flush",
+        400,
+        0,
+        memtable_bytes=1024,
+        sync="always",
+        extra_env={"MINIKV_FAULT": point},
+    )
+    stdout, stderr = process.communicate(timeout=120)
+    assert process.returncode == 9, stderr.decode("utf-8", "replace")[-800:]
+
+    acknowledged = [int(line) for line in stdout.decode().split() if line.strip()]
+    assert acknowledged, f"the fault never fired at {point}"
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        store = Store(str(db), sync="always", memtable_bytes=1024)
+
+    missing = [index for index in acknowledged if store.get(key_of(index)) != value_of(index)]
+    assert missing == [], f"{point} lost acknowledged writes: {missing[:5]}"
+
+    # The store must remain usable and internally consistent afterwards.
+    report = store.verify()
+    assert report["ok"] is True, report["errors"]
+    store.put(b"after-recovery", b"ok")
+    store.flush()
+    assert store.get(b"after-recovery") == b"ok"
+    store.close()
+
+    reopened = Store(str(db), sync="always")
+    assert reopened.get(b"after-recovery") == b"ok"
+    reopened.close()
 
 
 @pytest.mark.slow

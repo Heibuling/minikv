@@ -156,20 +156,41 @@ chunks instead of reading the file whole: recovery must no longer hold an
 entire WAL in memory, which the earlier code did.  It is 0.9 ms on this
 workload, and it removes an unbounded-memory failure mode.
 
-## Batching writes is worth 33x when fsync is on
+## Batching: where one fsync per batch stops paying
 
-With `sync="always"` every `put` pays its own fsync.  A `batch()` puts
-many operations in one WAL record with one CRC and one fsync.
-`python benchmarks/measure_batch.py`, 200 operations, 7 repeats:
+With `sync="always"` every single `put` pays its own fsync (~250 us
+here).  A `batch()` puts many operations into one WAL record: one CRC and
+one fsync.  `python benchmarks/measure_batch.py` sweeps the batch size,
+with and without fsync, so the point where batching stops helping is
+visible rather than assumed.  500 operations, median of 5 runs:
 
-| | median per op | runs (us/op) |
-| --- | --- | --- |
-| single `put` | 250.5 us | 271.2, 247.2, 245.9, 254.8, 250.5, 247.8, 283.5 |
-| `batch()` of 50 | 7.6 us | 8.6, 7.6, 7.8, 8.9, 7.1, 7.5, 6.9 |
+| batch size | fsyncs per op | `always` us/op | `never` us/op | speedup |
+| --- | --- | --- | --- | --- |
+| 1 | 1 | 258.50 | 9.21 | 1.0x |
+| 5 | 1/5 | 56.63 | 2.87 | 4.6x |
+| 10 | 1/10 | 27.35 | 2.09 | 9.5x |
+| 25 | 1/25 | 11.67 | 1.50 | 22.2x |
+| 50 | 1/50 | 7.70 | 1.33 | 33.6x |
+| 100 | 1/100 | 4.35 | 1.18 | 59.5x |
+| 250 | 1/250 | 2.49 | 1.16 | 103.7x |
+| 500 | 1/500 | 2.03 | 1.12 | 127.3x |
 
-**33x**, and the batched numbers are far more stable, because the cost is
-dominated by four fsyncs instead of two hundred.  This is the single
-biggest lever in the engine for anyone loading data with durability on.
+Two things are worth reading off this table.
+
+**The `never` column is the hill batching climbs toward.**  Without fsync
+a batched operation costs 1.1-1.3 us, and that barely moves with the batch
+size: it is the cost of the WAL record, not of the fsync.  At batch 500,
+`always` (2.03 us) is within 2x of `never` (1.12 us) -- the fsync has
+been amortized almost entirely away.
+
+**The returns flatten after about 100.**  Going from 50 to 500 removes
+5.7 us of fsync cost per operation but only 4.2 us of total time, because
+everything below ~1.1 us is the record itself.  A bigger batch also means
+more memory held and a longer window of writes that a power loss can take
+with it, which is the durability trade `batch()` exists to let a caller
+make deliberately.  50 was the number quoted in the README because it is
+where a single batch stops dominating the cost; 500 is where the curve
+goes flat.
 
 ## Known bottlenecks, and what is deliberately not optimized
 
@@ -194,9 +215,11 @@ biggest lever in the engine for anyone loading data with durability on.
 ## Files
 
 - `benchmarks/bench.py` -- the main suite.
-- `benchmarks/measure_batch.py` -- the repeated batch/fsync measurement.
+- `benchmarks/measure_batch.py` -- the batch-size sweep (writes
+  `batch-curve-<stamp>.json`).
 - `benchmarks/profile_reads.py`, `benchmarks/profile_writes.py` -- cProfile runs.
 - `benchmarks/results/bench-20261024T123521.json` -- canonical run (v1.1).
 - `benchmarks/results/bench-20261024T123518.json` -- repeat run.
 - `benchmarks/results/bench-20261024T114414.json` -- v1.0 run quoted above.
+- `benchmarks/results/batch-curve-20261024T142842.json` -- the sweep above.
 - `benchmarks/results/profile-reads.txt`, `profile-writes.txt` -- raw cProfile output.

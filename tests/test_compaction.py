@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import os
 
-from minikv import Store
+import pytest
+
+from minikv import ClosedStoreError, Store
 from minikv.compaction import merge_segments
 from minikv.memtable import TOMBSTONE
 from minikv.segment import SegmentReader, write_segment
@@ -126,24 +128,91 @@ def test_scan_started_before_compaction_keeps_reading(db_path):
 
     seen.extend(key for key, _ in rows)
     assert seen == expected
+    # Exhausting the scan releases its lease, so the retired files go.
+    assert instance.stats()["deferred_deletes"] == 0
     instance.close()
 
 
-def test_compaction_defers_file_deletion_until_close(db_path):
+def test_a_held_snapshot_defers_file_deletion(db_path):
+    """A live snapshot must keep the segment files compaction retires."""
     instance = Store(db_path, sync="never", memtable_bytes=1024)
     for i in range(200):
         instance.put(f"k{i:04d}".encode(), b"v")
     before = {name for name in os.listdir(db_path) if name.endswith(".sst")}
     assert len(before) >= 2
 
-    instance.compact()
-    during = {name for name in os.listdir(db_path) if name.endswith(".sst")}
-    assert before <= during, "inputs must survive until the store closes"
-    assert instance.stats()["deferred_deletes"] >= 1
+    with instance.snapshot() as view:
+        assert instance.stats()["live_snapshots"] == 1
+        instance.compact()
+        during = {name for name in os.listdir(db_path) if name.endswith(".sst")}
+        assert before <= during, "a held snapshot must keep the inputs on disk"
+        assert instance.stats()["deferred_deletes"] >= 1
+        assert view.get(b"k0000") == b"v"
 
-    instance.close()
+    # Releasing the last snapshot reclaims immediately, not at close().
     after = [name for name in os.listdir(db_path) if name.endswith(".sst")]
     assert len(after) == 1, f"retired files should be gone, found {after}"
+    assert instance.stats()["deferred_deletes"] == 0
+    instance.close()
+
+
+def test_explicit_snapshot_survives_compaction(db_path):
+    """A snapshot guarantees file lifetime, not isolation.
+
+    Its segment list is fixed, so compaction cannot take its files away.
+    The memtable is shared and still being written, which is why a
+    snapshot may see a write that happened after it was taken -- the
+    documented consequence of one writer, many readers (DESIGN.md section
+    6).  What it must never do is lose the data it was created over.
+    """
+    instance = Store(db_path, sync="never", memtable_bytes=1024)
+    for i in range(300):
+        instance.put(f"k{i:04d}".encode(), b"old")
+
+    with instance.snapshot() as view:
+        segments_before = len(view.segments)
+        instance.compact()
+        assert instance.stats()["deferred_deletes"] >= 1
+        assert len(view.segments) == segments_before, "the view must not change"
+        assert view.get(b"k0299") == b"old"
+        assert [key for key, _ in view.scan(b"k0000", b"k0004")] == [
+            b"k0000",
+            b"k0001",
+            b"k0002",
+            b"k0003",
+            b"k0004",
+        ]
+
+    # Releasing it lets the retired files go, without closing the store.
+    assert instance.stats()["deferred_deletes"] == 0
+    assert instance.get(b"k0299") == b"old"
+    instance.close()
+
+
+def test_released_snapshot_rejects_further_reads(db_path):
+    instance = Store(db_path, sync="never")
+    instance.put(b"a", b"1")
+    view = instance.snapshot()
+    view.close()
+    assert view.released is True
+    view.close()  # idempotent
+    with pytest.raises(ClosedStoreError):
+        view.get(b"a")
+    with pytest.raises(ClosedStoreError):
+        view.scan()
+    instance.close()
+
+
+def test_flush_forces_a_segment(db_path):
+    instance = Store(db_path, sync="never", memtable_bytes=1 << 20)
+    instance.put(b"a", b"1")
+    assert instance.stats()["segments"] == 0
+    instance.flush()
+    assert instance.stats()["segments"] == 1
+    instance.flush()  # empty memtable: a no-op
+    assert instance.stats()["segments"] == 1
+    assert instance.get(b"a") == b"1"
+    instance.close()
 
 
 def test_segments_flushed_during_compaction_are_kept(db_path, monkeypatch):

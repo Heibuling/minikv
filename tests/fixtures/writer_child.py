@@ -6,6 +6,10 @@ Usage:
 mode "deterministic": write keys sequentially and call os._exit(7) right
 after the put at index <kill_at> returns -- i.e. after it was acknowledged.
 
+mode "flush": write keys sequentially, printing each acknowledged index to
+stdout, and let MINIKV_FAULT kill the process at a named flush step.  The
+parent can then check that every acknowledged write is present.
+
 mode "run": write forever; the parent kills the process externally.
 """
 
@@ -33,6 +37,13 @@ def main(argv):
             store.put(key_of(index), value_of(index))
             if index == int(kill_at):
                 os._exit(7)
+    elif mode == "flush":
+        # Announce only after put() returned: everything printed here was
+        # acknowledged and must survive the injected fault.
+        for index in range(int(count)):
+            store.put(key_of(index), value_of(index))
+            print(index, flush=True)
+        store.close()
     else:
         index = 0
         while True:

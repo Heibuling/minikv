@@ -1,0 +1,169 @@
+{
+  "generated_at": "2026-10-24T14:28:42+0800",
+  "ops": 500,
+  "python": "3.12.14",
+  "repeats": 5,
+  "rows": [
+    {
+      "always_runs": [
+        258.5,
+        251.49,
+        246.99,
+        260.78,
+        271.35
+      ],
+      "always_us_per_op": 258.5,
+      "batch_size": 1,
+      "fsyncs_per_op": 1.0,
+      "never_runs": [
+        9.74,
+        9.03,
+        9.21,
+        9.39,
+        9.19
+      ],
+      "never_us_per_op": 9.21
+    },
+    {
+      "always_runs": [
+        56.67,
+        57.62,
+        56.63,
+        54.0,
+        54.02
+      ],
+      "always_us_per_op": 56.63,
+      "batch_size": 5,
+      "fsyncs_per_op": 0.2,
+      "never_runs": [
+        2.87,
+        2.87,
+        2.99,
+        2.8,
+        2.71
+      ],
+      "never_us_per_op": 2.87
+    },
+    {
+      "always_runs": [
+        27.96,
+        29.26,
+        27.35,
+        26.46,
+        25.49
+      ],
+      "always_us_per_op": 27.35,
+      "batch_size": 10,
+      "fsyncs_per_op": 0.1,
+      "never_runs": [
+        1.97,
+        2.09,
+        2.1,
+        2.21,
+        2.05
+      ],
+      "never_us_per_op": 2.09
+    },
+    {
+      "always_runs": [
+        11.67,
+        11.52,
+        12.6,
+        12.49,
+        11.64
+      ],
+      "always_us_per_op": 11.67,
+      "batch_size": 25,
+      "fsyncs_per_op": 0.04,
+      "never_runs": [
+        1.47,
+        1.49,
+        1.5,
+        1.56,
+        1.56
+      ],
+      "never_us_per_op": 1.5
+    },
+    {
+      "always_runs": [
+        7.01,
+        8.02,
+        7.4,
+        7.7,
+        7.75
+      ],
+      "always_us_per_op": 7.7,
+      "batch_size": 50,
+      "fsyncs_per_op": 0.02,
+      "never_runs": [
+        1.31,
+        1.31,
+        1.34,
+        1.36,
+        1.33
+      ],
+      "never_us_per_op": 1.33
+    },
+    {
+      "always_runs": [
+        4.35,
+        4.35,
+        4.16,
+        4.13,
+        4.42
+      ],
+      "always_us_per_op": 4.35,
+      "batch_size": 100,
+      "fsyncs_per_op": 0.01,
+      "never_runs": [
+        1.18,
+        1.17,
+        1.24,
+        1.18,
+        1.34
+      ],
+      "never_us_per_op": 1.18
+    },
+    {
+      "always_runs": [
+        2.44,
+        2.49,
+        2.5,
+        2.42,
+        2.56
+      ],
+      "always_us_per_op": 2.49,
+      "batch_size": 250,
+      "fsyncs_per_op": 0.004,
+      "never_runs": [
+        1.15,
+        1.16,
+        1.15,
+        1.16,
+        1.26
+      ],
+      "never_us_per_op": 1.16
+    },
+    {
+      "always_runs": [
+        2.03,
+        1.95,
+        2.32,
+        18.17,
+        1.84
+      ],
+      "always_us_per_op": 2.03,
+      "batch_size": 500,
+      "fsyncs_per_op": 0.002,
+      "never_runs": [
+        1.11,
+        1.12,
+        1.08,
+        1.14,
+        1.2
+      ],
+      "never_us_per_op": 1.12
+    }
+  ],
+  "value_bytes": 100
+}

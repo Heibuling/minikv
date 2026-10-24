@@ -65,6 +65,7 @@ from .encoding import (
     validate_pair,
 )
 from .errors import ClosedStoreError, CorruptRecordError, StoreLockedError
+from .faults import fault_point
 from .memtable import TOMBSTONE, MemTable
 from .segment import DEFAULT_BLOCK_BYTES, SegmentReader, fsync_dir, write_segment
 from .wal import SYNC_MODES, WAL, IntervalSyncer, warn_corruption
@@ -183,7 +184,11 @@ class Store:
         self._closed = False
         self._corruption_events = 0
         self._pending: list[tuple[MemTable, list[str]]] = []
+        # Segments compaction replaced.  They stay readable, and on disk,
+        # until no snapshot can reference them any more.
         self._retired: list[SegmentReader] = []
+        self._reclaim_lock = threading.Lock()
+        self._live_snapshots = 0
         self._syncer: IntervalSyncer | None = None
 
         self._directory_lock = _DirectoryLock(self.path)
@@ -402,10 +407,14 @@ class Store:
                 with self._lock:
                     self._segments = (reader, *self._segments)
                     self._snapshot = Snapshot(self._memtable, self._segments)
+                    fault_point("manifest_before")
                     self._write_manifest()
+                    fault_point("manifest_after")
+                fault_point("wal_before_delete")
                 for wal_path in wal_paths:
                     with contextlib.suppress(OSError):
                         os.unlink(wal_path)
+                fault_point("wal_after_delete")
         finally:
             self._flush_lock.release()
 
@@ -414,11 +423,18 @@ class Store:
     def get(self, key: bytes, default: bytes | None = None) -> bytes | None:
         key = _as_bytes(key, "key")
         self._check_open()
-        snapshot = self._snapshot
-        value = snapshot.memtable.get(key)
+        view = self._acquire_snapshot()
+        try:
+            return self._get_from(view, key, default)
+        finally:
+            self._release_snapshot()
+
+    @staticmethod
+    def _get_from(view: Snapshot, key: bytes, default: bytes | None) -> bytes | None:
+        value = view.memtable.get(key)
         if value is not None:
             return default if value is TOMBSTONE else value  # type: ignore[return-value]
-        for segment in snapshot.segments:
+        for segment in view.segments:
             value = segment.get(key)
             if value is not None:
                 return default if value is TOMBSTONE else value  # type: ignore[return-value]
@@ -444,20 +460,42 @@ class Store:
         if limit is not None and limit < 0:
             raise ValueError("limit must be >= 0")
         self._check_open()
-        snapshot = self._snapshot
-        segments = [segment for segment in snapshot.segments if segment.overlaps(start, end)]
+        view = self._acquire_snapshot()
+        try:
+            return self._leased(self._scan_from(view, start, end, reverse=reverse, limit=limit))
+        except BaseException:
+            self._release_snapshot()
+            raise
+
+    def _scan_from(
+        self,
+        view: Snapshot,
+        start: bytes,
+        end: bytes | None,
+        *,
+        reverse: bool,
+        limit: int | None,
+    ) -> Iterator[tuple[bytes, bytes]]:
+        segments = [segment for segment in view.segments if segment.overlaps(start, end)]
         if reverse:
-            sources = [snapshot.memtable.scan_backward(start, end)]
+            sources = [view.memtable.scan_backward(start, end)]
             sources.extend(segment.scan_backward(start, end) for segment in segments)
             merged = self._merge_sources_desc(sources)
         else:
-            sources = [snapshot.memtable.scan(start, end)]
+            sources = [view.memtable.scan(start, end)]
             sources.extend(segment.scan(start, end) for segment in segments)
             merged = self._merge_sources(sources)
         guarded = self._guarded(merged)
         if limit is None:
             return guarded
         return itertools.islice(guarded, limit)
+
+    def _leased(self, source: Iterator[tuple[bytes, bytes]]) -> Iterator[tuple[bytes, bytes]]:
+        """Hold a snapshot lease for exactly as long as the iterator lives."""
+        try:
+            yield from source
+        finally:
+            self._release_snapshot()
 
     def _guarded(self, source: Iterator[tuple[bytes, bytes]]) -> Iterator[tuple[bytes, bytes]]:
         """Fail with ClosedStoreError if the store is closed mid-iteration."""
@@ -524,6 +562,60 @@ class Store:
 
     # -- maintenance -----------------------------------------------------
 
+    def snapshot(self) -> StoreSnapshot:
+        """Return a read-only view with an explicit lifetime.
+
+        While a snapshot is held, compaction will not delete the segment
+        files it references, so a long scan cannot be invalidated halfway
+        through.  Release it with a context manager, close(), or by
+        dropping the last reference; the retired files are then reclaimed
+        immediately instead of at close().
+        """
+        self._check_open()
+        return StoreSnapshot(self, self._acquire_snapshot())
+
+    def _acquire_snapshot(self) -> Snapshot:
+        with self._reclaim_lock:
+            self._live_snapshots += 1
+        return self._snapshot
+
+    def _release_snapshot(self) -> None:
+        pending: list[SegmentReader] = []
+        with self._reclaim_lock:
+            self._live_snapshots -= 1
+            if self._live_snapshots <= 0:
+                self._live_snapshots = 0
+                pending, self._retired = self._retired, []
+        self._reclaim(pending)
+
+    def _drain_retired_locked(self) -> list[SegmentReader]:
+        """Hand over the retired segments, if no snapshot can reach them."""
+        with self._reclaim_lock:
+            if self._live_snapshots > 0:
+                return []
+            pending, self._retired = self._retired, []
+        return pending
+
+    @staticmethod
+    def _reclaim(readers: list[SegmentReader]) -> None:
+        for reader in readers:
+            reader.close()
+            with contextlib.suppress(OSError):
+                os.unlink(reader.path)
+
+    def flush(self) -> None:
+        """Force the current memtable to a segment, if it holds anything.
+
+        Makes the WAL a bounded, known size on demand: useful before a
+        backup, and in tests that want to control when a segment appears.
+        """
+        with self._lock:
+            self._check_open()
+            if not self._memtable:
+                return
+            self._enqueue_flush_locked()
+        self._drain_flushes()
+
     def compact(self) -> dict[str, int]:
         """Merge every live segment into one, dropping tombstones.
 
@@ -569,7 +661,10 @@ class Store:
                 self._retired.extend(readers)
                 self._segments = (*others, merged)
                 self._snapshot = Snapshot(self._memtable, self._segments)
+                fault_point("compaction_merged")
                 self._write_manifest()
+                fault_point("compaction_manifest")
+                self._reclaim(self._drain_retired_locked())
                 return {
                     "segments_merged": len(readers),
                     "segments_after": len(self._segments),
@@ -586,12 +681,19 @@ class Store:
         not raise on damage, so a caller can print all findings at once.
         """
         self._check_open()
+        view = self._acquire_snapshot()
+        try:
+            return self._verify_view(view)
+        finally:
+            self._release_snapshot()
+
+    def _verify_view(self, view: Snapshot) -> dict[str, object]:
         report: dict[str, object] = {"ok": True, "segments": [], "wal_files": [], "errors": []}
         segments_report: list[dict] = []
         wal_report: list[dict] = []
         errors: list[str] = []
 
-        for segment in self._snapshot.segments:
+        for segment in view.segments:
             try:
                 entries = segment.verify()
                 segments_report.append({"name": segment.name, "ok": True, "entries": entries})
@@ -640,6 +742,7 @@ class Store:
             "wal_bytes": wal_bytes,
             "pending_flushes": len(self._pending),
             "deferred_deletes": len(self._retired),
+            "live_snapshots": self._live_snapshots,
             "corruption_events": self._corruption_events,
             "fsync_dir_supported": os.name != "nt",
         }
@@ -656,13 +759,13 @@ class Store:
                 self._active_wal.sync()
             self._active_wal.close()
 
-            readers = list(self._segments) + list(self._retired)
-            self._retired = []
-            for reader in readers:
+            live = list(self._segments)
+            with self._reclaim_lock:
+                retired, self._retired = self._retired, []
+                self._live_snapshots = 0
+            for reader in live:
                 reader.close()
-            for reader in readers[len(self._segments):]:
-                with contextlib.suppress(OSError):
-                    os.unlink(reader.path)
+            self._reclaim(retired)
             self._directory_lock.release()
 
     def _sync_active_wal(self) -> None:
@@ -679,6 +782,76 @@ class Store:
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+class StoreSnapshot:
+    """A read-only view with an explicit lifetime.
+
+    The value of holding one is not isolation -- values are immutable, so
+    any view is stable -- it is *file lifetime*: while this object is
+    alive, compaction will not delete the segment files it points at, so a
+    long scan cannot be invalidated halfway through.  When the last
+    snapshot is released, the files compaction retired are unlinked and
+    their handles closed immediately, instead of accumulating until the
+    store closes.
+    """
+
+    __slots__ = ("_released", "_store", "_view")
+
+    def __init__(self, store: Store, view: Snapshot) -> None:
+        self._store = store
+        self._view = view
+        self._released = False
+
+    @property
+    def segments(self) -> tuple[SegmentReader, ...]:
+        """The segments this snapshot can read, newest first."""
+        return self._view.segments
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def get(self, key: bytes, default: bytes | None = None) -> bytes | None:
+        self._check_usable()
+        return self._store._get_from(self._view, _as_bytes(key, "key"), default)
+
+    def scan(
+        self,
+        start: bytes = b"",
+        end: bytes | None = None,
+        *,
+        reverse: bool = False,
+        limit: int | None = None,
+    ) -> Iterator[tuple[bytes, bytes]]:
+        self._check_usable()
+        start = _as_bytes(start, "start")
+        if end is not None:
+            end = _as_bytes(end, "end")
+        if limit is not None and limit < 0:
+            raise ValueError("limit must be >= 0")
+        return self._store._scan_from(self._view, start, end, reverse=reverse, limit=limit)
+
+    def _check_usable(self) -> None:
+        if self._released:
+            raise ClosedStoreError("this snapshot has been released")
+        self._store._check_open()
+
+    def close(self) -> None:
+        if not self._released:
+            self._released = True
+            self._store._release_snapshot()
+
+    def __enter__(self) -> StoreSnapshot:
+        self._check_usable()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self.close()
 
 
 class _Batch:

@@ -3,6 +3,7 @@
 Public surface:
 
     Store               the engine
+    StoreSnapshot       a read-only view that keeps its files alive
     MiniKVError         base class for every error
     StoreLockedError    the directory is already open elsewhere
     ClosedStoreError    operation on a closed store
@@ -14,7 +15,7 @@ Everything else is an implementation detail.  Runtime dependencies: none
 
 from __future__ import annotations
 
-from .engine import Store
+from .engine import Store, StoreSnapshot
 from .errors import ClosedStoreError, CorruptRecordError, MiniKVError, StoreLockedError
 
 __all__ = [
@@ -23,5 +24,6 @@ __all__ = [
     "MiniKVError",
     "Store",
     "StoreLockedError",
+    "StoreSnapshot",
 ]
-__version__ = "1.1.0"
+__version__ = "1.2.0"
