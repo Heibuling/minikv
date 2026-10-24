@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.  The format
 follows Keep a Changelog.
 
+## [Unreleased]
+
+### Documentation
+
+- The README is bilingual: `README.md` is Chinese (the repository front
+  page) and `README.en.md` is the English one, each linking to the other
+  on the first line below the badges.  Only the README is translated;
+  DESIGN.md, BENCHMARKS.md and the docs stay in English.
+
 ## [1.5.0] - 2026-10-24
 
 The library now passes mypy --strict.  No behaviour changed and no API

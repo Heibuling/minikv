@@ -193,7 +193,8 @@ is mocked:
 - dataloss from a segment file that is valid but from the wrong
   generation: the manifest checksums its bytes, not its meaning.
 
-These are listed so that the guarantee table in README.md can be read
+These are listed so that the guarantee table in README.md / README.en.md
+can be read
 literally.
 
 ## 6. Reproducing

@@ -33,7 +33,8 @@ mypy --platform darwin
 
 ## What a change needs to include
 
-- **A test that fails without it.**  Every guarantee in README.md has at
+- **A test that fails without it.**  Every guarantee in README.md (which
+  is the Chinese one; README.en.md is this document in English) has at
   least one test; new behaviour needs the same.  Bugs get a regression
   test that reproduces the bug.
 - **Real files, not mocks.**  The suite uses temporary directories and
