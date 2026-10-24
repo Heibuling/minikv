@@ -7,6 +7,14 @@ standard library only. Single process, no network, no background
 compaction thread. It exists to be read, tested and questioned -- not to
 run anything that matters.
 
+Three results this repository reproduces on one machine:
+
+- **~35x from batching**: 50 writes per `batch()` under `sync="always"`
+  cost 7.7 us/op against 266 us/op for single puts -- one fsync, not fifty.
+- **A miss costs nothing**: 0.004 s for 5 000 point-read misses, down from
+  0.042 s and level with SQLite, once segments recorded their key range.
+- **Nothing acknowledged is lost**: 0 losses across 140 crash points.
+
 ```python
 from minikv import Store
 
@@ -32,9 +40,8 @@ and only then deletes the WAL files it replaced. A read checks the memory
 table, then each segment from newest to oldest, using a recorded key range,
 a bloom filter and a sparse index so most files are never opened.
 `compact()` merges every segment into one and drops tombstones. The disk
-format is explicit little-endian byte layouts with CRC32 on every WAL
-record, segment data block, segment index and bloom filter; nothing is
-pickled.
+format is explicit little-endian layouts with CRC32 on every WAL record,
+segment data block, segment index and bloom filter; nothing is pickled.
 
 ## Guarantees
 
@@ -56,9 +63,9 @@ pickled.
 | Two processes on one directory | the second opener gets `StoreLockedError` |
 | Reclaiming disk during a long run | compaction defers deletion to `close()` |
 
-Keys are limited to 64 KiB and values to 16 MiB; exceeding either raises
-`ValueError` before anything is written. Empty keys and empty values are
-legal. One writer, one process: the second opener of a directory fails.
+Keys are limited to 64 KiB and values to 16 MiB, rejected with `ValueError`
+before anything is written; empty keys and values are legal. One writer,
+one process: the second opener of a directory fails.
 
 ## Durability modes
 
@@ -68,9 +75,8 @@ legal. One writer, one process: the second opener of a directory fails.
 | `interval` | every 100 ms | safe | up to 100 ms lost |
 | `never` | never | safe | may lose the tail |
 
-A Windows process cannot fsync a directory, so publishing a segment via
-rename is only as durable as NTFS itself; `stats()` reports
-`fsync_dir_supported: False` there.
+A Windows process cannot fsync a directory, so a segment rename is only as
+durable as NTFS itself: `stats()` reports `fsync_dir_supported: False`.
 
 ## Benchmarks (this machine, 5 000 ops, 3 runs, median)
 
@@ -84,12 +90,8 @@ rename is only as durable as NTFS itself; `stats()` reports
 | restart, 5 000 WAL records | 0.008 s | 0.001 s | 10.9x |
 | compaction, 76 segments | 0.026 s | not applicable | -- |
 
-With `sync="always"`, grouping 50 writes into one `batch()` costs
-7.6 us/op against 250.5 us/op for single puts: **33x**, because the batch
-pays one fsync instead of fifty. SQLite is a C library with a page cache, a
-B-tree and years of tuning; the gap is the interpreter, one Python object
-per record and one syscall per write. BENCHMARKS.md has both cProfile runs,
-the changes they led to, and what is still slow on purpose.
+SQLite is a C library with a page cache and years of tuning; the remaining
+gap is the interpreter, one Python object per record and one syscall each.
 
 ## When you should not use it
 
@@ -112,7 +114,6 @@ the changes they led to, and what is still slow on purpose.
 python -m pip install pytest pytest-cov hypothesis ruff
 ruff check .
 pytest --cov=minikv        # coverage floor is 85% (pyproject.toml)
-python benchmarks/bench.py
 ```
 
 CI runs ruff, the suite and the coverage floor on Linux, macOS and Windows
