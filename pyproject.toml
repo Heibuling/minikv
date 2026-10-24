@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minikv"
-version = "1.0.0"
+version = "1.1.0"
 description = "A small, auditable LSM-style embedded key-value store (standard library only)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -40,6 +40,12 @@ markers = ["slow: end-to-end crash and concurrency tests"]
 [tool.coverage.run]
 source = ["minikv"]
 branch = true
+
+[tool.coverage.report]
+# Measured at 89% on the development machine.  The floor only guards
+# against a change that adds code without tests; it is not a target.
+fail_under = 85
+exclude_lines = ["if TYPE_CHECKING:", "pragma: no cover", "raise NotImplementedError"]
 
 [tool.ruff]
 line-length = 110

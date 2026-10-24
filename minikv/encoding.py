@@ -29,15 +29,20 @@ SSTable data record (the unit stored inside a data block)
 
     klen(4) | tombstone(1) | vlen(4) | key | value
 
+SSTable index block
+-------------------
+
+    min_klen(4) | max_klen(4) | min_key | max_key | entry...
+
+The two leading key lengths give the block the key range it covers, which
+lets a read skip a whole segment without touching its data.  The header is
+inside the block that the index CRC covers.
+
 SSTable footer (the last 56 bytes of the file)
 ----------------------------------------------
 
     index_offset(8) index_len(8) bloom_offset(8) bloom_len(8)
     index_crc(4) bloom_crc(4) num_entries(8) magic(8)
-
-Data blocks do not carry their CRC inline; each sparse-index entry
-stores (first_key, offset, length, crc) for the block it points at, so a
-damaged block is detected by the read that touches it.
 """
 
 from __future__ import annotations
@@ -51,9 +56,18 @@ from .errors import CorruptRecordError, IncompleteRecordError
 UINT32_MAX = 0xFFFFFFFF
 UINT64_MAX = 0xFFFFFFFFFFFFFFFF
 
+#: Largest key the engine accepts (64 KiB).  Keys live in the memtable and
+#: in every sparse index entry that references them, so they are bounded.
+MAX_KEY_BYTES = 64 << 10
+
+#: Largest value the engine accepts (16 MiB).  One value is one record and
+#: must fit in memory alongside its key; bigger payloads belong in files.
+MAX_VALUE_BYTES = 16 << 20
+
 # --- WAL -----------------------------------------------------------------
 
-WAL_HEADER = struct.Struct("<IBII")          # crc, type, klen, vlen
+WAL_HEADER = struct.Struct("<IBII")          # crc, type, klen, vlen (decode)
+WAL_CRC = struct.Struct("<I")                # crc on its own (encode)
 WAL_BODY_HEAD = struct.Struct("<BII")        # type, klen, vlen
 BATCH_OP = struct.Struct("<BII")             # type, klen, vlen
 
@@ -66,37 +80,66 @@ WAL_TYPE_BATCH = 3
 SST_RECORD_HEAD = struct.Struct("<IBI")      # klen, tombstone, vlen
 SST_INDEX_HEAD = struct.Struct("<I")         # key length
 SST_INDEX_TAIL = struct.Struct("<QII")       # offset, length, crc
+SST_INDEX_HEADER = struct.Struct("<II")      # min key length, max key length
 SST_FOOTER = struct.Struct("<QQQQIIQ8s")     # see module docstring
-SST_MAGIC = b"MINIKV01"
+SST_MAGIC = b"MINIKV02"
 SST_FOOTER_SIZE = SST_FOOTER.size            # 56
 
 BLOOM_HEAD = struct.Struct("<III")           # bit_size, num_hashes, nbytes
 
 
-def crc32(data: bytes, seed: int = 0) -> int:
+def crc32(data, seed: int = 0) -> int:
     """CRC32 as a positive 32-bit integer (zlib returns a signed value)."""
     return zlib.crc32(data, seed) & UINT32_MAX
 
 
-def _check_len(n: int, what: str) -> None:
+def _check_u32(n: int, what: str) -> None:
     if not 0 <= n <= UINT32_MAX:
         raise ValueError(f"{what} length {n} does not fit in a uint32")
 
 
+def validate_key(key: bytes) -> None:
+    """Reject keys the on-disk format cannot represent."""
+    if len(key) > MAX_KEY_BYTES:
+        raise ValueError(f"key is {len(key)} bytes; the limit is {MAX_KEY_BYTES}")
+
+
+def validate_value(value: bytes) -> None:
+    """Reject values the on-disk format cannot represent."""
+    if len(value) > MAX_VALUE_BYTES:
+        raise ValueError(f"value is {len(value)} bytes; the limit is {MAX_VALUE_BYTES}")
+
+
+def validate_pair(key: bytes, value: bytes) -> None:
+    validate_key(key)
+    validate_value(value)
+    _check_u32(len(key), "key")
+    _check_u32(len(value), "value")
+
+
 def encode_wal_record(rec_type: int, key: bytes = b"", value: bytes = b"") -> bytes:
     """Serialize one WAL record, CRC included."""
-    _check_len(len(key), "key")
-    _check_len(len(value), "value")
-    body = WAL_BODY_HEAD.pack(rec_type, len(key), len(value)) + key + value
-    return WAL_HEADER.pack(crc32(body), rec_type, len(key), len(value)) + key + value
+    _check_u32(len(key), "key")
+    _check_u32(len(value), "value")
+    klen = len(key)
+    vlen = len(value)
+    # A record is exactly crc(4) plus the body, so the body can be built
+    # once, checksummed, and prefixed: key and value are copied once, and
+    # zlib.crc32 is called once per record.  (The obvious version copied
+    # key+value a second time to build the record; rolling the CRC over
+    # three pieces instead was measured to be slower, because crc32 is
+    # only cheap when it is called once.)
+    body = WAL_BODY_HEAD.pack(rec_type, klen, vlen) + key + value
+    return WAL_CRC.pack(crc32(body)) + body
 
 
-def decode_wal_record(buf: bytes, offset: int) -> tuple[int, bytes, bytes, int]:
+def decode_wal_record(buf, offset: int) -> tuple[int, bytes, bytes, int]:
     """Decode the record at 'offset'.
 
     Returns (type, key, value, next_offset).  Raises IncompleteRecordError
     when the buffer ends mid-record (a torn tail) and CorruptRecordError
-    when the CRC does not match.
+    when the CRC does not match.  'buf' may be bytes, bytearray or a
+    memoryview, so a replay loop can parse a reused buffer in place.
     """
     if offset + WAL_HEADER.size > len(buf):
         raise IncompleteRecordError("torn WAL header")
@@ -105,9 +148,9 @@ def decode_wal_record(buf: bytes, offset: int) -> tuple[int, bytes, bytes, int]:
     end = start + klen + vlen
     if end > len(buf):
         raise IncompleteRecordError("torn WAL body")
-    key = buf[start : start + klen]
-    value = buf[start + klen : end]
-    body = buf[offset + 4 : end]
+    key = bytes(buf[start : start + klen])
+    value = bytes(buf[start + klen : end])
+    body = memoryview(buf)[offset + 4 : end]
     if crc32(body) != crc:
         raise CorruptRecordError(f"WAL record at offset {offset} failed CRC")
     return rec_type, key, value, end
@@ -117,8 +160,8 @@ def encode_batch(ops: Iterable[tuple[int, bytes, bytes]]) -> bytes:
     """Serialize (type, key, value) operations into a batch payload."""
     out = bytearray()
     for rec_type, key, value in ops:
-        _check_len(len(key), "key")
-        _check_len(len(value), "value")
+        _check_u32(len(key), "key")
+        _check_u32(len(value), "value")
         out += BATCH_OP.pack(rec_type, len(key), len(value))
         out += key
         out += value
@@ -137,22 +180,22 @@ def decode_batch(payload: bytes) -> list[tuple[int, bytes, bytes]]:
         end = start + klen + vlen
         if end > len(payload):
             raise CorruptRecordError("truncated batch payload")
-        key = payload[start : start + klen]
-        value = payload[start + klen : end]
-        ops.append((rec_type, key, value))
+        payload_key = payload[start : start + klen]
+        payload_value = payload[start + klen : end]
+        ops.append((rec_type, payload_key, payload_value))
         offset = end
     return ops
 
 
 def encode_sst_record(key: bytes, value: bytes, tombstone: bool) -> bytes:
     """Serialize one key inside an SSTable data block."""
-    _check_len(len(key), "key")
-    _check_len(len(value), "value")
+    _check_u32(len(key), "key")
+    _check_u32(len(value), "value")
     head = SST_RECORD_HEAD.pack(len(key), 1 if tombstone else 0, len(value))
     return head + key + value
 
 
-def decode_sst_record(buf: bytes, offset: int, limit: int) -> tuple[bytes, bytes, bool, int]:
+def decode_sst_record(buf, offset: int, limit: int) -> tuple[bytes, bytes, bool, int]:
     """Decode the SSTable record at 'offset'; 'limit' bounds the block."""
     if offset + SST_RECORD_HEAD.size > limit:
         raise CorruptRecordError("truncated SSTable record header")
@@ -161,6 +204,6 @@ def decode_sst_record(buf: bytes, offset: int, limit: int) -> tuple[bytes, bytes
     end = start + klen + vlen
     if end > limit:
         raise CorruptRecordError("truncated SSTable record body")
-    key = buf[start : start + klen]
-    value = buf[start + klen : end]
+    key = bytes(buf[start : start + klen])
+    value = bytes(buf[start + klen : end])
     return key, value, bool(tomb), end

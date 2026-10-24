@@ -6,15 +6,17 @@ File layout
     [data block 0][data block 1] ... [sparse index][bloom][footer]
 
 A data block is a concatenation of records, around 4 KiB each.  The
-block's CRC lives in the index entry rather than inline, so the writer
-can emit a block without patching bytes afterwards.
+block's CRC lives in the index entry rather than inline, so the writer can
+emit a block without patching bytes afterwards.
 
-The sparse index holds one entry per block -- (first key, offset, length,
-crc) -- which is enough to jump to the block that could contain a key and
-to verify it before decoding.  The index and the bloom filter are small
-and verified eagerly when the file is opened; data blocks are verified
-lazily by the read that touches them.  That trade-off is documented in
-DESIGN.md.
+The sparse index starts with the segment's key range and then holds one
+entry per block -- (first key, offset, length, crc).  The range lets a
+read skip a whole segment with two comparisons; the entries let it jump to
+the block that could contain a key and verify that block before decoding.
+
+The index and the bloom filter are small and verified eagerly when the
+file is opened; data blocks are verified lazily by the read that touches
+them.  That trade-off is documented in DESIGN.md.
 """
 
 from __future__ import annotations
@@ -31,13 +33,14 @@ from .encoding import (
     SST_FOOTER,
     SST_FOOTER_SIZE,
     SST_INDEX_HEAD,
+    SST_INDEX_HEADER,
     SST_INDEX_TAIL,
     SST_MAGIC,
     crc32,
     decode_sst_record,
     encode_sst_record,
 )
-from .errors import CorruptRecordError
+from .errors import ClosedStoreError, CorruptRecordError
 from .memtable import TOMBSTONE
 
 DEFAULT_BLOCK_BYTES = 4096
@@ -86,20 +89,36 @@ class _Bloom:
         hashes = max(1, min(30, round(bits_per_key * 0.6931)))
         return cls(bits, hashes)
 
-    def _positions(self, key: bytes) -> Iterator[int]:
-        h1 = crc32(key)
-        h2 = crc32(key, 0x9E3779B1) | 1
-        for i in range(self.num_hashes):
-            yield (h1 + i * h2) % self.bit_size
+    def _hash_pair(self, key: bytes) -> tuple[int, int]:
+        """Two independent probes; the rest follow from double hashing.
+
+        Kept as plain arithmetic rather than a generator: profiling the
+        flush path showed ~157k generator resumes for 20k keys, which was
+        a visible share of the write cost.
+        """
+        return crc32(key), crc32(key, 0x9E3779B1) | 1
 
     def add(self, key: bytes) -> None:
         bits = self.bits
-        for pos in self._positions(key):
-            bits[pos >> 3] |= 1 << (pos & 7)
+        size = self.bit_size
+        hash1, hash2 = self._hash_pair(key)
+        probe = hash1
+        for _ in range(self.num_hashes):
+            position = probe % size
+            bits[position >> 3] |= 1 << (position & 7)
+            probe += hash2
 
     def might_contain(self, key: bytes) -> bool:
         bits = self.bits
-        return all(bits[pos >> 3] & 1 << (pos & 7) for pos in self._positions(key))
+        size = self.bit_size
+        hash1, hash2 = self._hash_pair(key)
+        probe = hash1
+        for _ in range(self.num_hashes):
+            position = probe % size
+            if not bits[position >> 3] & 1 << (position & 7):
+                return False
+            probe += hash2
+        return True
 
     def to_bytes(self) -> bytes:
         return BLOOM_HEAD.pack(self.bit_size, self.num_hashes, len(self.bits)) + bytes(self.bits)
@@ -134,6 +153,19 @@ def write_segment(
     block_first: bytes | None = None
     block_offset = 0
     count = 0
+    first_key: bytes | None = None
+    last_key: bytes | None = None
+
+    def flush_buffer() -> None:
+        nonlocal buffer, block_first, block_offset
+        if not buffer:
+            return
+        assert block_first is not None
+        handle.write(buffer)
+        index.append((block_first, block_offset, len(buffer), crc32(buffer)))
+        block_offset += len(buffer)
+        buffer = bytearray()
+        block_first = None
 
     try:
         with open(tmp_path, "wb") as handle:
@@ -141,29 +173,26 @@ def write_segment(
                 tombstone = value is TOMBSTONE
                 if block_first is None:
                     block_first = key
+                if first_key is None:
+                    first_key = key
+                last_key = key
                 buffer += encode_sst_record(key, b"" if tombstone else value, tombstone)  # type: ignore[arg-type]
                 bloom.add(key)
                 count += 1
                 if len(buffer) >= block_bytes:
-                    assert block_first is not None
-                    handle.write(buffer)
-                    index.append((block_first, block_offset, len(buffer), crc32(bytes(buffer))))
-                    block_offset += len(buffer)
-                    buffer.clear()
-                    block_first = None
-
-            if buffer:
-                assert block_first is not None
-                handle.write(buffer)
-                index.append((block_first, block_offset, len(buffer), crc32(bytes(buffer))))
-                block_offset += len(buffer)
-                buffer.clear()
+                    flush_buffer()
+            flush_buffer()
 
             index_offset = block_offset
             index_bytes = bytearray()
-            for first_key, offset, length, crc in index:
-                index_bytes += SST_INDEX_HEAD.pack(len(first_key))
-                index_bytes += first_key
+            min_key = first_key if first_key is not None else b""
+            max_key = last_key if last_key is not None else b""
+            index_bytes += SST_INDEX_HEADER.pack(len(min_key), len(max_key))
+            index_bytes += min_key
+            index_bytes += max_key
+            for entry_key, offset, length, crc in index:
+                index_bytes += SST_INDEX_HEAD.pack(len(entry_key))
+                index_bytes += entry_key
                 index_bytes += SST_INDEX_TAIL.pack(offset, length, crc)
             handle.write(index_bytes)
 
@@ -177,7 +206,7 @@ def write_segment(
                     len(index_bytes),
                     bloom_offset,
                     len(bloom_bytes),
-                    crc32(bytes(index_bytes)),
+                    crc32(index_bytes),
                     crc32(bloom_bytes),
                     count,
                     SST_MAGIC,
@@ -196,7 +225,12 @@ def write_segment(
 
 
 class SegmentReader:
-    """Read-only view of one segment file."""
+    """Read-only view of one segment file.
+
+    In the unlikely event the store is closed between a caller's check and
+    this object's next read, the read raises ClosedStoreError rather than
+    leaking a low-level 'I/O operation on closed file'.
+    """
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -232,30 +266,56 @@ class SegmentReader:
         self.num_entries = num_entries
         self.data_end = index_offset
         self.size_bytes = size
-        self._index = self._parse_index(index_bytes)
+        self._min_key, self._max_key, self._index = self._parse_index(index_bytes)
         self._keys = [entry[0] for entry in self._index]
         self._bloom = _Bloom.from_bytes(bloom_bytes)
         # One cached handle serves the point-read path: opening a file per
         # get() costs ~90 us on Windows and dominated every read benchmark.
         self._handle = None
         self._io_lock = threading.Lock()
+        self._closed = False
 
-    def _parse_index(self, data: bytes) -> list[IndexEntry]:
+    def _parse_index(self, data: bytes) -> tuple[bytes, bytes, list[IndexEntry]]:
+        if len(data) < SST_INDEX_HEADER.size:
+            raise CorruptRecordError(f"{self.name}: truncated index header")
+        min_len, max_len = SST_INDEX_HEADER.unpack_from(data, 0)
+        cursor = SST_INDEX_HEADER.size
+        if cursor + min_len + max_len > len(data):
+            raise CorruptRecordError(f"{self.name}: truncated key range")
+        min_key = data[cursor : cursor + min_len]
+        cursor += min_len
+        max_key = data[cursor : cursor + max_len]
+        cursor += max_len
+
         entries: list[IndexEntry] = []
-        offset = 0
-        while offset < len(data):
-            if offset + SST_INDEX_HEAD.size > len(data):
+        while cursor < len(data):
+            if cursor + SST_INDEX_HEAD.size > len(data):
                 raise CorruptRecordError(f"{self.name}: truncated index")
-            (klen,) = SST_INDEX_HEAD.unpack_from(data, offset)
-            start = offset + SST_INDEX_HEAD.size
+            (klen,) = SST_INDEX_HEAD.unpack_from(data, cursor)
+            start = cursor + SST_INDEX_HEAD.size
             end = start + klen + SST_INDEX_TAIL.size
             if end > len(data):
                 raise CorruptRecordError(f"{self.name}: truncated index")
-            key = data[start : start + klen]
+            entry_key = data[start : start + klen]
             block_offset, length, crc = SST_INDEX_TAIL.unpack_from(data, start + klen)
-            entries.append((key, block_offset, length, crc))
-            offset = end
-        return entries
+            entries.append((entry_key, block_offset, length, crc))
+            cursor = end
+        return min_key, max_key, entries
+
+    # -- range -----------------------------------------------------------
+
+    @property
+    def key_range(self) -> tuple[bytes, bytes]:
+        """(minimum key, maximum key) stored in this segment."""
+        return self._min_key, self._max_key
+
+    def overlaps(self, start: bytes, end: bytes | None) -> bool:
+        """True when the segment can hold a key in [start, end]."""
+        if self.num_entries == 0:
+            return False
+        if end is not None and self._min_key > end:
+            return False
+        return not self._max_key < start
 
     # -- block access ----------------------------------------------------
 
@@ -272,17 +332,24 @@ class SegmentReader:
     def _block_for(self, key: bytes) -> int:
         return max(bisect.bisect_right(self._keys, key) - 1, 0)
 
+    def _cached_handle(self):
+        if self._closed:
+            raise ClosedStoreError(f"segment {self.name} was closed with its store")
+        if self._handle is None:
+            self._handle = open(self.path, "rb")  # noqa: SIM115 - closed by close()
+        return self._handle
+
     # -- public reads ----------------------------------------------------
 
     def get(self, key: bytes) -> object:
         """Return bytes, TOMBSTONE, or None (definitely absent)."""
-        if not self._index or not self._bloom.might_contain(key):
+        if not self._index or not self.overlaps(key, key):
+            return None
+        if not self._bloom.might_contain(key):
             return None
         position = self._block_for(key)
         with self._io_lock:
-            if self._handle is None:
-                self._handle = open(self.path, "rb")  # noqa: SIM115 - closed by close()
-            data = self._read_block(self._handle, position)
+            data = self._read_block(self._cached_handle(), position)
         offset = 0
         while offset < len(data):
             rec_key, value, tombstone, offset = decode_sst_record(data, offset, len(data))
@@ -294,7 +361,7 @@ class SegmentReader:
 
     def scan(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
         """Yield start <= key <= end in ascending order."""
-        if not self._index:
+        if not self.overlaps(start, end):
             return
         position = self._block_for(start)
         with open(self.path, "rb") as handle:
@@ -311,6 +378,35 @@ class SegmentReader:
                         yield key, TOMBSTONE if tombstone else value
                 position += 1
 
+    def scan_backward(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
+        """Yield start <= key <= end in descending order.
+
+        A block is decoded forward into a small list (bounded by the block
+        size), then walked backwards: variable-length records cannot be
+        read in reverse without knowing where they start.
+        """
+        if not self.overlaps(start, end):
+            return
+        position = len(self._index) - 1 if end is None else self._block_for(end)
+        with open(self.path, "rb") as handle:
+            while position >= 0:
+                if self._keys[position] > (end if end is not None else self._max_key):
+                    position -= 1
+                    continue
+                data = self._read_block(handle, position)
+                rows = []
+                offset = 0
+                while offset < len(data):
+                    key, value, tombstone, offset = decode_sst_record(data, offset, len(data))
+                    rows.append((key, TOMBSTONE if tombstone else value))
+                for key, value in reversed(rows):
+                    if end is not None and key > end:
+                        continue
+                    if key < start:
+                        return
+                    yield key, value
+                position -= 1
+
     def items(self) -> Iterator[tuple[bytes, object]]:
         """Yield every entry in ascending key order."""
         with open(self.path, "rb") as handle:
@@ -325,24 +421,29 @@ class SegmentReader:
         """Release the cached read handle; the file itself is untouched."""
         with self._io_lock:
             handle, self._handle = self._handle, None
+            self._closed = True
         if handle is not None:
             handle.close()
 
     def verify(self) -> int:
         """Verify every block and every record; returns the entry count.
 
-        Used by tests and by anyone who wants a full scrub instead of the
-        lazy per-read verification the engine performs.
+        Used by tests, by Store.verify() and by the fsck CLI command.
         """
         count = 0
         previous: bytes | None = None
+        first: bytes | None = None
         for key, _ in self.items():
             if previous is not None and key <= previous:
                 raise CorruptRecordError(f"{self.name}: keys out of order")
+            if first is None:
+                first = key
             previous = key
             count += 1
         if count != self.num_entries:
             raise CorruptRecordError(
                 f"{self.name}: footer says {self.num_entries} entries, found {count}"
             )
+        if count and (first != self._min_key or previous != self._max_key):
+            raise CorruptRecordError(f"{self.name}: index key range does not match the data")
         return count

@@ -5,10 +5,12 @@ close/reopen cycle."""
 from __future__ import annotations
 
 import os
+import pathlib
 
 import pytest
 
-from minikv import ClosedStoreError, Store
+from minikv import ClosedStoreError, Store, StoreLockedError
+from minikv.encoding import MAX_KEY_BYTES, MAX_VALUE_BYTES
 
 
 def test_put_get_delete(store):
@@ -148,3 +150,77 @@ def test_invalid_configuration_is_rejected(db_path):
         Store(db_path, sync="often")
     with pytest.raises(ValueError):
         Store(db_path, memtable_bytes=10)
+
+
+def test_second_open_of_the_same_directory_is_rejected(db_path):
+    first = Store(db_path, sync="never")
+    try:
+        with pytest.raises(StoreLockedError):
+            Store(db_path, sync="never")
+    finally:
+        first.close()
+    # the lock dies with the store, so reopening afterwards works
+    reopened = Store(db_path, sync="never")
+    reopened.close()
+
+
+def test_scan_after_close_raises_closed_store_error(db_path):
+    instance = Store(db_path, sync="never")
+    for i in range(10):
+        instance.put(f"k{i}".encode(), b"v")
+    rows = instance.scan()
+    assert next(rows) == (b"k0", b"v")
+    instance.close()
+    with pytest.raises(ClosedStoreError):
+        next(rows)
+
+
+def test_key_and_value_limits_are_enforced(store):
+    with pytest.raises(ValueError):
+        store.put(b"k" * (MAX_KEY_BYTES + 1), b"v")
+    with pytest.raises(ValueError):
+        store.put(b"k", b"v" * (MAX_VALUE_BYTES + 1))
+    with pytest.raises(ValueError):
+        store.delete(b"k" * (MAX_KEY_BYTES + 1))
+    with pytest.raises(ValueError), store.batch() as batch:
+        batch.put(b"k" * (MAX_KEY_BYTES + 1), b"v")
+    # the documented limits themselves are legal
+    store.put(b"k" * MAX_KEY_BYTES, b"")
+    assert store.get(b"k" * MAX_KEY_BYTES) == b""
+
+
+def test_verify_reports_a_healthy_store(store):
+    store.put(b"a", b"1")
+    report = store.verify()
+    assert report["ok"] is True
+    assert report["errors"] == []
+    assert all(entry["ok"] for entry in report["segments"])
+
+
+def test_verify_reports_a_damaged_segment(db_path):
+    instance = Store(db_path, sync="never", memtable_bytes=1024)
+    for i in range(60):
+        instance.put(f"k{i:04d}".encode(), b"value")
+    instance.close()
+
+    segment = sorted(p for p in pathlib.Path(db_path).iterdir() if p.suffix == ".sst")[0]
+    data = bytearray(segment.read_bytes())
+    data[8] ^= 0xFF
+    segment.write_bytes(bytes(data))
+
+    opener = Store(db_path, sync="never", memtable_bytes=1024)
+    report = opener.verify()
+    assert report["ok"] is False
+    assert report["errors"]
+    opener.close()
+
+
+def test_maintenance_after_close_raises(db_path):
+    instance = Store(db_path, sync="never")
+    instance.close()
+    with pytest.raises(ClosedStoreError):
+        instance.compact()
+    with pytest.raises(ClosedStoreError):
+        instance.verify()
+    with pytest.raises(ClosedStoreError):
+        instance.stats()

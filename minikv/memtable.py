@@ -141,3 +141,15 @@ class MemTable:
             value = data.get(key, _ABSENT)
             if value is not _ABSENT:
                 yield key, value
+
+    def scan_backward(self, start: bytes, end: bytes | None) -> Iterator[tuple[bytes, object]]:
+        """Yield entries with start <= key <= end, highest key first."""
+        keys = self.sorted_keys()
+        lo = bisect.bisect_left(keys, start)
+        hi = len(keys) if end is None else bisect.bisect_right(keys, end)
+        data = self._data
+        for index in range(hi - 1, lo - 1, -1):
+            key = keys[index]
+            value = data.get(key, _ABSENT)
+            if value is not _ABSENT:
+                yield key, value

@@ -6,6 +6,11 @@ in place, because writes that arrived during the flush belong to the next
 generation).  A WAL file is deleted only after the segment holding its
 contents is durable.
 
+Replay streams the file in fixed-size chunks instead of reading it whole:
+a WAL is normally bounded by the memtable threshold, but a crash can leave
+several of them behind, and recovery should not have to hold all of that
+in memory at once.
+
 Durability policy
 -----------------
 
@@ -38,6 +43,10 @@ from .encoding import (
 from .errors import CorruptRecordError, IncompleteRecordError
 
 SYNC_MODES = ("always", "interval", "never")
+
+#: Replay reads this many bytes per iteration.  A record larger than the
+#: chunk simply grows the buffer until it is complete.
+DEFAULT_REPLAY_CHUNK = 64 << 10
 
 
 @dataclass
@@ -98,36 +107,65 @@ class WAL:
     # -- replay ----------------------------------------------------------
 
     @staticmethod
-    def replay(path: str) -> ReplayResult:
-        """Read a WAL file, stopping at the first torn or corrupt record.
+    def replay(path: str, chunk_bytes: int = DEFAULT_REPLAY_CHUNK) -> ReplayResult:
+        """Read a WAL file in chunks, stopping at the first bad record.
 
-        Returns every complete record plus the byte length that verified,
-        so the caller can truncate the file to that point.
+        Returns every complete record plus the byte length that verified --
+        before the damage -- so the caller can truncate the file to that
+        point.  Nothing after the first torn or corrupt record is decoded.
         """
         result = ReplayResult()
         try:
-            with open(path, "rb") as handle:
-                data = handle.read()
-        except FileNotFoundError:
+            result.file_bytes = os.path.getsize(path)
+        except OSError:
             return result
-        result.file_bytes = len(data)
-        offset = 0
-        try:
-            while offset < len(data):
-                rec_type, key, value, next_offset = decode_wal_record(data, offset)
-                if rec_type == WAL_TYPE_BATCH:
-                    for op_type, op_key, op_value in decode_batch(value):
-                        result.entries.append((op_type, op_key, op_value))
-                elif rec_type in (WAL_TYPE_PUT, WAL_TYPE_DELETE):
-                    result.entries.append((rec_type, key, value))
-                else:
-                    raise CorruptRecordError(f"unknown WAL record type {rec_type}")
-                offset = next_offset
-        except IncompleteRecordError:
-            result.problem = "torn"
-        except CorruptRecordError:
-            result.problem = "corrupt"
-        result.valid_bytes = offset
+        if result.file_bytes == 0:
+            return result
+
+        buffer = bytearray()
+        consumed = 0
+        problem: str | None = None
+
+        def emit(rec_type: int, key: bytes, value: bytes) -> None:
+            if rec_type == WAL_TYPE_BATCH:
+                result.entries.extend(decode_batch(value))
+            elif rec_type in (WAL_TYPE_PUT, WAL_TYPE_DELETE):
+                result.entries.append((rec_type, key, value))
+            else:
+                raise CorruptRecordError(f"unknown WAL record type {rec_type}")
+
+        with open(path, "rb") as handle:
+            while True:
+                chunk = handle.read(chunk_bytes)
+                if not chunk:
+                    break
+                buffer += chunk
+                offset = 0
+                broken = False
+                while True:
+                    try:
+                        rec_type, key, value, next_offset = decode_wal_record(buffer, offset)
+                    except IncompleteRecordError:
+                        break
+                    except CorruptRecordError:
+                        broken = True
+                        break
+                    try:
+                        emit(rec_type, key, value)
+                    except CorruptRecordError:
+                        broken = True
+                        break
+                    offset = next_offset
+                del buffer[:offset]
+                consumed += offset
+                if broken:
+                    problem = "corrupt"
+                    break
+
+        if problem is None and buffer:
+            problem = "torn"
+        result.problem = problem
+        result.valid_bytes = consumed
         return result
 
     @staticmethod

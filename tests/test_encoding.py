@@ -7,7 +7,10 @@ import struct
 
 import pytest
 
+from minikv import encoding
 from minikv.encoding import (
+    MAX_KEY_BYTES,
+    MAX_VALUE_BYTES,
     SST_FOOTER,
     SST_MAGIC,
     WAL_TYPE_DELETE,
@@ -19,6 +22,8 @@ from minikv.encoding import (
     encode_batch,
     encode_sst_record,
     encode_wal_record,
+    validate_key,
+    validate_value,
 )
 from minikv.errors import CorruptRecordError, IncompleteRecordError
 
@@ -110,7 +115,15 @@ def test_crc32_is_always_positive():
     assert crc32(b"x" * 1000) <= 0xFFFFFFFF
 
 
-def test_length_overflow_is_rejected():
-    huge = 0xFFFFFFFF
+def test_oversized_key_and_value_are_rejected():
     with pytest.raises(ValueError):
-        encode_wal_record(WAL_TYPE_PUT, b"k" * 4, b"v" * (huge + 1))
+        validate_key(b"k" * (MAX_KEY_BYTES + 1))
+    with pytest.raises(ValueError):
+        validate_value(b"v" * (MAX_VALUE_BYTES + 1))
+    validate_key(b"k" * MAX_KEY_BYTES)
+    validate_value(b"v" * MAX_VALUE_BYTES)
+
+
+def test_uint32_lengths_are_still_checked():
+    with pytest.raises(ValueError):
+        encoding._check_u32(1 << 33, "key")

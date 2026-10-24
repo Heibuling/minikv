@@ -135,6 +135,32 @@ def scenario_compact(root, ops, value):
     return elapsed, segments_before, segments_after
 
 
+def scenario_batch(root, ops, value, batch_size, sync):
+    """Return (seconds for single puts, seconds for batched puts)."""
+    single = new_dir(root, "batch_single")
+    shutil.rmtree(single, ignore_errors=True)
+    os.makedirs(single)
+    store = Store(single, sync=sync, memtable_bytes=64 << 10)
+    started = time.perf_counter()
+    for i in range(ops):
+        store.put(key_for(i), value)
+    single_seconds = time.perf_counter() - started
+    store.close()
+
+    batched = new_dir(root, "batch_grouped")
+    shutil.rmtree(batched, ignore_errors=True)
+    os.makedirs(batched)
+    store = Store(batched, sync=sync, memtable_bytes=64 << 10)
+    started = time.perf_counter()
+    for base in range(0, ops, batch_size):
+        with store.batch() as group:
+            for i in range(base, min(base + batch_size, ops)):
+                group.put(key_for(i), value)
+    batched_seconds = time.perf_counter() - started
+    store.close()
+    return single_seconds, batched_seconds
+
+
 def scenario_sqlite_restart(root, ops, value):
     """SQLite's equivalent of a restart: reopen the file and read one row."""
     db = os.path.join(new_dir(root, "sqlite_restart"), "bench.db")
@@ -242,6 +268,23 @@ def run_store_suite(ops, value_size, runs, root):
         unit=f"{ops} keys",
         segments_before=counts[0][0],
         segments_after=counts[0][1],
+    )
+
+    # How much a batch is worth: with sync="always" each single put pays an
+    # fsync, while a batch of N pays one for the whole group.
+    fsync_ops, fsync_batch = 200, 50
+    singles, grouped = [], []
+    for run in range(runs):
+        one, many = scenario_batch(
+            os.path.join(root, f"fsync_{run}"), fsync_ops, value, fsync_batch, "always"
+        )
+        singles.append(one)
+        grouped.append(many)
+    out["batch_fsync"] = summarize(
+        grouped,
+        unit=f"{fsync_ops} ops in batches of {fsync_batch}, sync=always",
+        single_per_op_us=round(statistics.median(singles) / fsync_ops * 1e6, 1),
+        batched_per_op_us=round(statistics.median(grouped) / fsync_ops * 1e6, 1),
     )
     return out
 

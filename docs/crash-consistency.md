@@ -66,6 +66,12 @@ Enforced in `encoding.decode_wal_record`, `segment.SegmentReader._read_block`,
 CRC; replay applies all of its operations or stops before it.
 Enforced in `encoding.encode_batch` / `wal.WAL.replay`.
 
+**I8 -- One writer per directory.** Opening a store takes an exclusive
+lock on a `LOCK` file; a second opener raises `StoreLockedError` rather
+than interleaving WAL appends with the first.  The lock is released when
+the process exits, so a crash does not leave the directory unopenable.
+Enforced in `engine._DirectoryLock`; tested in `test_engine.py`.
+
 ## 3. Recovery algorithm
 
 1. Delete `*.tmp` leftovers.
@@ -75,13 +81,17 @@ Enforced in `encoding.encode_batch` / `wal.WAL.replay`.
 3. Delete every `seg-*.sst` the manifest does not list.
 4. Open each live segment: verify magic, footer bounds, index CRC, bloom
    CRC, then parse the sparse index.
-5. Replay `wal-*.log` in ascending sequence order. For each file, stop at
-   the first torn or failing record, truncate to the last verified byte,
-   and warn once.
+5. Replay `wal-*.log` in ascending sequence order. Each file is read in
+   64 KiB chunks and parsed in place, so recovery never holds a whole WAL
+   in memory.  For each file, stop at the first torn or failing record,
+   truncate to the last verified byte, and warn once.
 6. Keep the highest-numbered WAL as the active append target; the rest are
    deleted after the next successful flush.
 7. If the recovered memtable is already at the size threshold, flush it
    immediately.
+
+`Store.verify()` and `minikv fsck` re-run steps 4 and 5 and decode every
+record on purpose -- the read path verifies lazily, this does not.
 
 ## 4. How the tests inject faults
 
@@ -122,9 +132,10 @@ is mocked:
 
 - power loss with a lying disk controller;
 - filesystem behaviour on network shares;
-- concurrent processes;
-- long-running soak with repeated compaction (the deferred-delete list is
-  bounded by the number of compactions, but nothing asserts that).
+- two processes racing for the same directory (the lock is asserted to
+  reject the second opener, not to survive a hostile one);
+- dataloss from a segment file that is valid but from the wrong
+  generation: the manifest checksums its bytes, not its meaning.
 
 These are listed so that the guarantee table in README.md can be read
 literally.
@@ -134,7 +145,8 @@ literally.
 ```
 pytest tests/test_crash_recovery.py -q     # ~20 s, 140 kill points
 pytest tests/test_corruption.py -q         # ~2 s
-pytest -q                                  # 86 tests, ~30 s
+pytest -q                                  # 108 tests, ~33 s
+pytest tests/test_compaction.py -q         # includes the soak and I5 tests
 ```
 
 All crash tests use `sync="always"`; testing the weaker modes for

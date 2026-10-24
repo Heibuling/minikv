@@ -1,0 +1,20 @@
+         1110229 function calls (1110191 primitive calls) in 0.509 seconds
+
+   Ordered by: internal time
+   List reduced from 97 to 12 due to restriction <12>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+    20000    0.130    0.000    0.130    0.000 {method 'write' of '_io.FileIO' objects}
+      152    0.054    0.000    0.054    0.000 {built-in method _io.open}
+       76    0.040    0.001    0.040    0.001 {built-in method nt.replace}
+       76    0.034    0.000    0.034    0.000 {built-in method nt.fsync}
+    20000    0.024    0.000    0.506    0.000 C:\Users\Eric0\Desktop\Dsh工作区\minikv\minikv\engine.py:324(put)
+    20000    0.020    0.000    0.037    0.000 C:\Users\Eric0\Desktop\Dsh工作区\minikv\minikv\encoding.py:120(encode_wal_record)
+    19646    0.017    0.000    0.031    0.000 C:\Users\Eric0\Desktop\Dsh工作区\minikv\minikv\segment.py:101(add)
+302296/302258    0.016    0.000    0.016    0.000 {built-in method builtins.len}
+    20000    0.013    0.000    0.025    0.000 C:\Users\Eric0\Desktop\Dsh工作区\minikv\minikv\encoding.py:113(validate_pair)
+    19646    0.013    0.000    0.022    0.000 C:\Users\Eric0\Desktop\Dsh工作区\minikv\minikv\encoding.py:190(encode_sst_record)
+       38    0.012    0.000    0.139    0.004 C:\Users\Eric0\Desktop\Dsh工作区\minikv\minikv\segment.py:136(write_segment)
+       38    0.012    0.000    0.012    0.000 {built-in method nt.unlink}
+
+

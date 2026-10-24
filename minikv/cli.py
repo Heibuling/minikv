@@ -76,6 +76,27 @@ def cmd_compact(args) -> int:
     return 0
 
 
+def cmd_fsck(args) -> int:
+    """Read back every block of every segment and every WAL record."""
+    with _store(args) as store:
+        report = store.verify()
+    for entry in report["segments"]:
+        if entry.get("ok"):
+            print(f"segment {entry['name']}: ok ({entry.get('entries', 0)} entries)")
+        else:
+            print(f"segment {entry['name']}: FAILED {entry.get('error')}")
+    for entry in report["wal_files"]:
+        if entry["ok"]:
+            print(f"{entry['name']}: ok ({entry['records']} records, {entry['bytes']} bytes)")
+        else:
+            print(f"{entry['name']}: {entry['problem']} record after {entry['bytes']} bytes")
+    if report["ok"]:
+        print("fsck: no problems found")
+        return 0
+    print(f"fsck: {len(report['errors'])} problem(s) found")
+    return 1
+
+
 def cmd_bench(args) -> int:
     """A deliberately small in-process benchmark; see benchmarks/bench.py."""
     count = args.count
@@ -133,6 +154,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     compact = sub.add_parser("compact", help="merge all segments")
     compact.set_defaults(func=cmd_compact)
+
+    fsck = sub.add_parser("fsck", help="verify every segment block and WAL record")
+    fsck.set_defaults(func=cmd_fsck)
 
     bench = sub.add_parser("bench", help="quick in-process benchmark")
     bench.add_argument("--count", type=int, default=2000)

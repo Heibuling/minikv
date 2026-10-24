@@ -149,3 +149,32 @@ def test_single_byte_damage_never_yields_wrong_data(tmp_path):
         checked += 1
         path.write_bytes(original)
     assert checked == 60
+
+
+def test_key_range_is_recorded_and_enforced(tmp_path):
+    reader = build(tmp_path / "seg-000001.sst", pairs_of(100))
+    low, high = reader.key_range
+    assert low == b"k0000"
+    assert high == b"k0099"
+    assert reader.overlaps(b"k0050", b"k0055")
+    assert not reader.overlaps(b"a", b"b")
+    assert not reader.overlaps(b"z", None)
+    assert reader.get(b"zzz") is None
+
+
+def test_backward_scan_matches_forward_scan(tmp_path):
+    reader = build(tmp_path / "seg-000001.sst", pairs_of(100))
+    forward = list(reader.scan(b"k0010", b"k0040"))
+    backward = list(reader.scan_backward(b"k0010", b"k0040"))
+    assert backward == list(reversed(forward))
+    assert next(iter(reader.scan_backward(b"k0090", None)))[0] == b"k0099"
+    assert list(reader.scan_backward(b"k0090", b"k0092")) == [
+        (b"k0092", b"v92"),
+        (b"k0091", b"v91"),
+        (b"k0090", b"v90"),
+    ]
+
+
+def test_empty_segment_overlaps_nothing(tmp_path):
+    reader = build(tmp_path / "seg-000001.sst", [])
+    assert reader.overlaps(b"", None) is False

@@ -4,6 +4,8 @@ readable after compaction."""
 
 from __future__ import annotations
 
+import os
+
 from minikv import Store
 from minikv.compaction import merge_segments
 from minikv.memtable import TOMBSTONE
@@ -102,3 +104,88 @@ def test_merge_of_empty_inputs_is_valid(tmp_path):
     output = str(tmp_path / "seg-000003.sst")
     assert merge_segments([right, left], output) == 0
     assert SegmentReader(output).num_entries == 0
+
+
+def test_scan_started_before_compaction_keeps_reading(db_path):
+    """Invariant I5: a snapshot taken before compaction stays readable.
+
+    Compaction retires its input files instead of unlinking them, precisely
+    so an iterator that is already walking them cannot fail.
+    """
+    instance = Store(db_path, sync="never", memtable_bytes=1024)
+    for i in range(400):
+        instance.put(f"k{i:04d}".encode(), b"v")
+    expected = [f"k{i:04d}".encode() for i in range(400)]
+
+    rows = instance.scan(b"", None)
+    seen = [next(rows)[0] for _ in range(5)]
+
+    result = instance.compact()
+    assert result["segments_after"] == 1
+    assert instance.stats()["deferred_deletes"] >= 1
+
+    seen.extend(key for key, _ in rows)
+    assert seen == expected
+    instance.close()
+
+
+def test_compaction_defers_file_deletion_until_close(db_path):
+    instance = Store(db_path, sync="never", memtable_bytes=1024)
+    for i in range(200):
+        instance.put(f"k{i:04d}".encode(), b"v")
+    before = {name for name in os.listdir(db_path) if name.endswith(".sst")}
+    assert len(before) >= 2
+
+    instance.compact()
+    during = {name for name in os.listdir(db_path) if name.endswith(".sst")}
+    assert before <= during, "inputs must survive until the store closes"
+    assert instance.stats()["deferred_deletes"] >= 1
+
+    instance.close()
+    after = [name for name in os.listdir(db_path) if name.endswith(".sst")]
+    assert len(after) == 1, f"retired files should be gone, found {after}"
+
+
+def test_segments_flushed_during_compaction_are_kept(db_path, monkeypatch):
+    """Compaction merges without the writer lock, so a flush can land mid-merge."""
+    import minikv.engine as engine_module
+
+    instance = Store(db_path, sync="never", memtable_bytes=1024)
+    for i in range(200):
+        instance.put(f"k{i:04d}".encode(), b"v")
+    assert instance.stats()["segments"] >= 2
+
+    real_merge = engine_module.merge_segments
+
+    def merge_then_flush(readers, output, block_bytes):
+        # a writer arrives while the merge is running
+        instance.put(b"during-merge", b"kept")
+        return real_merge(readers, output, block_bytes)
+
+    monkeypatch.setattr(engine_module, "merge_segments", merge_then_flush)
+    result = instance.compact()
+    monkeypatch.undo()
+
+    assert result["segments_after"] >= 1
+    assert instance.get(b"during-merge") == b"kept"
+    assert instance.get(b"k0000") == b"v"
+    assert instance.get(b"k0199") == b"v"
+    instance.close()
+
+
+def test_repeated_compaction_does_not_leak_files(db_path):
+    instance = Store(db_path, sync="never", memtable_bytes=1024)
+    for cycle in range(4):
+        for i in range(150):
+            instance.put(f"c{cycle}-k{i:04d}".encode(), b"v" * 20)
+        instance.compact()
+    instance.close()
+
+    remaining = [name for name in os.listdir(db_path) if name.endswith(".sst")]
+    assert len(remaining) == 1, f"expected one segment, found {remaining}"
+
+    reopened = Store(db_path, sync="never")
+    assert reopened.stats()["segments"] == 1
+    assert reopened.get(b"c3-k0000") == b"v" * 20
+    assert reopened.get(b"c0-k0149") == b"v" * 20
+    reopened.close()

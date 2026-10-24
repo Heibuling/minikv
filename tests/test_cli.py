@@ -68,3 +68,46 @@ def test_bench_runs(tmp_path):
 def test_bad_usage_exits_2(tmp_path):
     result = cli(tmp_path / "db", "put", "only-a-key")
     assert result.returncode == 2
+
+
+def test_main_runs_in_process_for_coverage(capsys, tmp_path):
+    """The other CLI tests use a subprocess; this one exercises the code."""
+    from minikv.cli import main
+
+    db = str(tmp_path / "db")
+    assert main(["--db", db, "put", "k", "v"]) == 0
+    assert main(["--db", db, "get", "k"]) == 0
+    assert capsys.readouterr().out == "v\n"
+    assert main(["--db", db, "scan", "--start", "k"]) == 0
+    assert main(["--db", db, "stats"]) == 0
+    assert main(["--db", db, "compact"]) == 0
+    assert main(["--db", db, "fsck"]) == 0
+    assert main(["--db", db, "del", "k"]) == 0
+    assert main(["--db", db, "get", "k"]) == 1
+    assert main(["--db", db, "bench", "--count", "5", "--value-size", "4"]) == 0
+    capsys.readouterr()
+
+
+def test_fsck_on_a_healthy_store(tmp_path):
+    db = tmp_path / "db"
+    for i in range(5):
+        cli(db, "put", f"k{i}", "v")
+    result = cli(db, "fsck")
+    assert result.returncode == 0
+    assert b"no problems found" in result.stdout
+
+
+def test_fsck_detects_a_damaged_segment(tmp_path):
+    db = tmp_path / "db"
+    for i in range(60):
+        cli(db, "--memtable-bytes", "1024", "put", f"k{i:04d}", "value")
+    segments = sorted(p for p in db.iterdir() if p.suffix == ".sst")
+    assert segments, "the small memtable should have produced segments"
+
+    data = bytearray(segments[0].read_bytes())
+    data[8] ^= 0xFF
+    segments[0].write_bytes(bytes(data))
+
+    result = cli(db, "fsck")
+    assert result.returncode == 1
+    assert b"problem" in result.stdout

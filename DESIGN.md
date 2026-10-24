@@ -120,9 +120,10 @@ and "manifest updated" would leave an orphan that never goes away.
 ## 4. fsync semantics and cost
 
 `sync="always"` fsyncs the WAL descriptor before `put()` returns. On the
-benchmark machine an fsync costs roughly 0.1-1 ms depending on the drive
-and on whether the filesystem is busy, which is why the write benchmarks
-run with `sync="never"`: they measure the engine, not the disk.
+benchmark machine an fsync costs roughly 0.25 ms: a single put measures
+250.5 us per operation, while fifty puts sharing one fsync measure 7.6 us
+each (BENCHMARKS.md). That is why the throughput benchmarks run with
+`sync="never"` -- they measure the engine, not the disk.
 
 The three modes are not cosmetic:
 
@@ -137,10 +138,11 @@ Python and reached the kernel; only a machine crash can lose them.
 The 140-point crash suite runs with `always` precisely because that is
 the mode with a claim worth testing.
 
-One acknowledged write costs one fsync. Group commit -- batching the
-fsyncs of concurrent writers -- would be the obvious next optimization;
-it is listed as future work rather than implemented, because the
-single-writer lock already serialises the calls.
+One acknowledged write costs one fsync. `batch()` is how a single writer
+avoids that: fifty operations become one WAL record, one CRC and one
+fsync, worth 33x per operation in the measurement above. Group commit
+across *concurrent* writers would help a workload this API deliberately
+does not offer, because there is only ever one writer.
 
 ## 5. Crash consistency model
 
@@ -167,8 +169,10 @@ warning.
 
 Single writer, many readers.
 
-- Every mutation takes one `RLock`. This includes `put`, `delete`,
-  batch commit, flush bookkeeping and compaction.
+- Every mutation takes one `RLock`. This includes `put`, `delete`, batch
+  commit and flush bookkeeping. Compaction takes it only to capture the
+  segment list and to splice the result back in; the merge itself runs
+  outside it, so writers are not stalled for the duration of a merge.
 - Readers take no lock. They load the `_snapshot` attribute -- an
   immutable `(memtable, segments)` tuple -- and work from it.
 - The memtable is only ever appended to or overwritten in place while it
@@ -217,8 +221,10 @@ The first version opened the segment file on every `get()`. cProfile on
 opening a file on this Windows machine costs about 90 us.
 
 Keeping one handle per segment changed the read benchmark from 0.573 s to
-0.081 s for 5 000 point reads -- about 7x -- and dropped the gap to
-SQLite from 76x to 12.6x.
+0.081 s for 5 000 point reads -- about 7x -- and dropped the gap to SQLite
+from 76x to 12.6x.  A later change took the same row to 0.058 s by
+recording each segment's key range, so a segment that cannot contain the
+key is rejected before its bloom filter is consulted.
 
 The cost is lifecycle complexity: on Windows a file with an open handle
 cannot be deleted, so `compact()` cannot unlink its inputs. They are
@@ -238,6 +244,12 @@ With one index entry per block, the index is about 3.2 KiB -- roughly
 A lookup reads at most one 4 KiB block; the bloom filter rejects most
 segments without any I/O at all.
 
+The index header also stores the segment's (min_key, max_key).  Two byte
+comparisons then reject a segment before the bloom filter runs, which is
+why a point-read miss costs 0.004 s for 5 000 probes against 0.042 s
+before the header was added -- and why the miss row now matches SQLite
+(1.1x).
+
 The trade is that a lookup may decode up to 34 records linearly instead
 of doing one binary search over all keys. At these sizes the difference
 is a few microseconds; at millions of keys per segment it would be the
@@ -252,8 +264,8 @@ delete to shadow -- and keeps the read path at O(number of segments)
 before compaction.
 
 The price is write amplification and disk headroom. On the benchmark
-workload 70 small segments (about 570 KiB of live data) are rewritten
-into one file in 0.039 s, i.e. every byte is read once and written once
+workload 76 small segments (about 570 KiB of live data) are rewritten
+into one file in 0.026 s, i.e. every byte is read once and written once
 per compaction. A leveled design rewrites less per compaction but must
 track overlapping key ranges, and tombstones can only be dropped at the
 bottom level.
@@ -263,21 +275,42 @@ enough. For a store that compacts often while the working set is large,
 it is the wrong design, which is why "leveled compaction" is the first
 item under future work.
 
+### 7.5 One process, enforced rather than requested
+
+The 1.0 engine documented "do not open a directory twice" and did nothing
+about it: two writers would interleave WAL appends and lose data with no
+error. The store now takes an exclusive lock on a `LOCK` file (flock on
+POSIX, msvcrt byte-range locking on Windows) and the second opener raises
+`StoreLockedError`.
+
+The cost is one extra file in the directory and one open plus one lock per
+`Store`, not per operation. In the same pass keys and values were bounded
+-- 64 KiB and 16 MiB -- so a single call cannot exhaust memory before the
+format rejects it; both limits raise `ValueError` before anything is
+written, and the documented boundaries are accepted.
+
 ## 8. Known limitations
 
-- **Writers are serialised during compaction.** Compaction holds the
-  writer lock for its whole duration; readers are unaffected because they
-  never take it. At 570 KiB this is 40 ms; at gigabytes it would be
-  unacceptable.
-- **Reverse scans materialise.** `scan(reverse=True)` builds a list of
-  the matching range and reverses it. Forward scans are streaming.
-- **No group commit.** Each `sync="always"` write pays its own fsync.
-- **One process.** There is no lock file; opening the same directory from
-  two processes will corrupt it.
-- **Retired segments hold descriptors** until `close()`.
+- **Compaction rewrites everything.** It no longer holds the writer lock
+  for its duration, but it still reads and writes every live byte, and the
+  retired files stay on disk until `close()`.
+- **No group commit for concurrent writers.** `batch()` covers the single
+  writer this API offers; a multi-writer design would need more.
+- **Retired segments hold a descriptor** until `close()`. A process that
+  compacts thousands of times without closing would run out of handles.
+- **Reverse scans decode a block forward and then walk it backwards.** They
+  stream and honour `limit`, but they are not the cheapest traversal.
+- **Recovery still reads every WAL record.** Streaming replay removed the
+  unbounded-memory failure mode, not the time: reopening 5 000 records
+  takes 0.008 s against SQLite's 0.001 s, and improving that needs a
+  checkpoint rather than a faster loop.
 - **No checksums on the manifest's meaning**, only on its bytes: a
   manifest that is valid but lists the wrong generation cannot be
   detected. It is written only after the segments it lists are durable.
+- **Format changes are not migratable.** `SST_MAGIC` moved to
+  `MINIKV02` for the key-range header; `MINIKV01` files are not read.
+- **Windows cannot fsync a directory**, so a rename is only as durable as
+  NTFS itself. `stats()` reports `fsync_dir_supported: False` there.
 
 ## 9. Prior art and attribution
 

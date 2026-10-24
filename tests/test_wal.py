@@ -109,3 +109,46 @@ def test_close_is_idempotent(tmp_path):
 def test_invalid_sync_mode_is_rejected(tmp_path):
     with pytest.raises(ValueError):
         WAL(str(tmp_path / "wal-000001.log"), sync="sometimes")
+
+
+def test_streaming_replay_matches_whole_file_with_tiny_chunks(tmp_path):
+    path = str(tmp_path / "wal-000001.log")
+    wal = WAL(path, sync="never")
+    for i in range(500):
+        wal.append_put(f"k{i:04d}".encode(), b"v" * (i % 40))
+    wal.close()
+
+    whole = WAL.replay(path, chunk_bytes=1 << 20)
+    assert whole.problem is None
+    assert len(whole.entries) == 500
+    for chunk in (7, 64, 4096):
+        assert WAL.replay(path, chunk_bytes=chunk).entries == whole.entries
+
+
+def test_a_record_larger_than_the_chunk_still_replays(tmp_path):
+    path = str(tmp_path / "wal-000001.log")
+    wal = WAL(path, sync="never")
+    payload = b"x" * (32 << 10)
+    wal.append_put(b"big", payload)
+    wal.append_put(b"small", b"1")
+    wal.close()
+
+    result = WAL.replay(path, chunk_bytes=1024)
+    assert result.problem is None
+    assert result.entries == [(WAL_TYPE_PUT, b"big", payload), (WAL_TYPE_PUT, b"small", b"1")]
+
+
+def test_streaming_replay_still_stops_at_a_torn_tail(tmp_path):
+    path = str(tmp_path / "wal-000001.log")
+    wal = WAL(path, sync="never")
+    for i in range(20):
+        wal.append_put(f"k{i}".encode(), b"v")
+    wal.close()
+    good = os.path.getsize(path)
+    with open(path, "ab") as handle:
+        handle.write(b"\x01\x02\x03")
+
+    result = WAL.replay(path, chunk_bytes=16)
+    assert result.problem == "torn"
+    assert result.valid_bytes == good
+    assert len(result.entries) == 20
