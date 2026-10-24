@@ -33,7 +33,7 @@ Not modelled, and therefore not guaranteed:
 **I1 -- Acknowledged writes survive.** With `sync="always"`, once `put()`
 returns, the record is fsynced in the WAL and will be replayed after any
 process kill.
-Enforced in `wal.WAL._write`; tested by 128 deterministic kill points.
+Enforced in `wal.WAL._write`; tested by 140 deterministic kill points.
 
 **I2 -- The WAL is the only source of unflushed truth.** A memtable is
 never the sole copy of an acknowledged write: every mutation is appended
@@ -132,7 +132,7 @@ literally.
 ## 6. Reproducing
 
 ```
-pytest tests/test_crash_recovery.py -q     # ~20 s, 128 kill points
+pytest tests/test_crash_recovery.py -q     # ~20 s, 140 kill points
 pytest tests/test_corruption.py -q         # ~2 s
 pytest -q                                  # 86 tests, ~30 s
 ```

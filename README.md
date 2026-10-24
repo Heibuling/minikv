@@ -42,7 +42,7 @@ bloom filter. Nothing is pickled.
 
 | Guarantee | Mechanism | Test |
 | --- | --- | --- |
-| `sync="always"`: an acknowledged write survives a process kill | fsync of the WAL record before returning | 128 deterministic kill points, 0 losses |
+| `sync="always"`: an acknowledged write survives a process kill | fsync of the WAL record before returning | 140 deterministic kill points, 0 losses |
 | A torn WAL tail is truncated, never decoded | per-record CRC and length bounds | `test_corruption.py` |
 | Damaged segment bytes raise, never return wrong data | per-block CRC checked before decoding | single-byte sweeps |
 | A batch is all-or-nothing | one WAL record carries the whole batch | `test_engine.py` |

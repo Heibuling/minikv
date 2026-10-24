@@ -134,7 +134,7 @@ The three modes are not cosmetic:
 
 A process kill is safe even in `never` mode because the bytes have left
 Python and reached the kernel; only a machine crash can lose them.
-The 128-point crash suite runs with `always` precisely because that is
+The 140-point crash suite runs with `always` precisely because that is
 the mode with a claim worth testing.
 
 One acknowledged write costs one fsync. Group commit -- batching the

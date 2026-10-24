@@ -1,6 +1,6 @@
 """This file proves the headline durability claim: with sync="always", a
 write that returned successfully is still there after the process is
-killed.  100 deterministic kill points, plus external kills."""
+killed.  140 deterministic kill points, plus 8 external kills."""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def value_of(index):
 
 
 @pytest.mark.slow
-def test_100_kill_points_preserve_every_acknowledged_write(tmp_path):
+def test_120_kill_points_preserve_every_acknowledged_write(tmp_path):
     random.seed(20261024)
     kill_points = list(range(60)) * 2
     random.shuffle(kill_points)

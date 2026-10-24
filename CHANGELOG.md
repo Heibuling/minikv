@@ -26,7 +26,7 @@ what the release contains, not a series of published versions.
 - `MANIFEST` listing the live segment set, written atomically and
   checksummed; unlisted segments are removed on the next open.
 - CLI: `get`, `put`, `del`, `scan`, `stats`, `compact`, `bench`.
-- 86 tests, including 128 deterministic crash points, 8 external kills,
+- 86 tests, including 140 deterministic crash points, 8 external kills,
   single-byte damage sweeps and a 10 000-operation property test.
 - Benchmarks with a SQLite baseline, and a cProfile-driven optimization
   of the point-read path (0.573 s to 0.081 s for 5 000 reads).
