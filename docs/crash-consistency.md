@@ -84,14 +84,19 @@ Enforced in `engine._DirectoryLock`; tested in `test_engine.py`.
 3. Delete every `seg-*.sst` the manifest does not list.
 4. Open each live segment: verify magic, footer bounds, index CRC, bloom
    CRC, then parse the sparse index.
-5. Replay `wal-*.log` in ascending sequence order. Each file is read in
-   64 KiB chunks and parsed in place, so recovery never holds a whole WAL
-   in memory.  For each file, stop at the first torn or failing record,
-   truncate to the last verified byte, and warn once.
-6. Keep the highest-numbered WAL as the active append target; the rest are
+5. Delete every `wal-*.log` whose sequence number is at or below the
+   manifest's checkpoint watermark, without reading it: a segment already
+   holds those records.  This is the crash window between "manifest
+   updated" and "WAL unlinked".
+6. Replay the remaining WALs in ascending sequence order. Each file is read
+   in 64 KiB chunks and parsed in place, and each record is applied to the
+   memtable as it is decoded, so recovery holds neither the whole WAL nor
+   a list of every record in memory.  For each file, stop at the first torn
+   or failing record, truncate to the last verified byte, and warn once.
+7. Keep the highest-numbered WAL as the active append target; the rest are
    deleted after the next successful flush.
-7. If the recovered memtable is already at the size threshold, flush it
-   immediately.
+8. If the recovered memtable is already at the size threshold, flush it
+   immediately, which records a new checkpoint watermark.
 
 `Store.verify()` and `minikv fsck` re-run steps 4 and 5 and decode every
 record on purpose -- the read path verifies lazily, this does not.
@@ -197,7 +202,7 @@ literally.
 pytest tests/test_crash_recovery.py -q     # 140 kill points + 6 flush faults
 pytest tests/test_corruption.py -q         # ~2 s
 pytest tests/test_properties.py -q         # stateful machine + hypothesis
-pytest -q                                  # 119 tests, ~43 s
+pytest -q                                  # 124 tests, ~40 s
 pytest tests/test_compaction.py -q         # includes the soak and I5 tests
 ```
 

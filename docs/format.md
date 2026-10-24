@@ -119,18 +119,22 @@ the bloom CRC.  Data blocks are verified by the read that touches them;
 
 ## Manifest
 
-    minikv-manifest-v1
-    seg-000009.sst
-    seg-000007.sst
+    minikv-manifest-v2
+    seg-000009.sst 12
+    seg-000007.sst 8
     crc32 1f0c3a9d
 
 The CRC covers every line before the `crc32` line, including its
-terminator.  Lines after the magic name the live segments, newest first.
-Written as `MANIFEST.tmp`, fsynced, renamed, then the directory is fsynced
-where the platform supports it.
+terminator.  Lines after the magic name the live segments, newest first,
+followed by the highest WAL sequence number each one covers -- the
+checkpoint watermark.  Written as `MANIFEST.tmp`, fsynced, renamed, then
+the directory is fsynced where the platform supports it.
 
 A manifest that is missing, malformed or fails its CRC is not fatal: the
-store warns, rebuilds the live set from the directory and rewrites it.
+store warns, rebuilds the live set from the directory and rewrites it.  A
+rebuilt live set has watermark 0, so nothing is skipped and every WAL is
+replayed -- slower, and always safe.  A `minikv-manifest-v1` file (no
+coverage column) is treated the same way.
 
 ## Order of operations
 
@@ -143,8 +147,14 @@ A flush:
 
 1. write `seg-NNNNNN.sst.tmp` and fsync it;
 2. rename it to `seg-NNNNNN.sst`, then fsync the directory (POSIX);
-3. write the manifest listing the new live set, fsync, rename, fsync dir;
+3. write the manifest listing the new live set and the highest WAL
+   sequence it covers, fsync, rename, fsync dir;
 4. unlink the WAL files whose contents are now inside that segment.
+
+On the next open, any WAL at or below the recorded watermark is deleted
+without being read: its records are already in a segment.  That is the
+crash window between steps 3 and 4, and it is why a start after a crash
+does not replay records that were already durable.
 
 A crash between any two steps leaves either the previous state or the new
 one.  Each of those steps is a named fault point in `minikv/faults.py`,

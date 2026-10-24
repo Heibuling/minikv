@@ -3,6 +3,49 @@
 All notable changes to this project are documented here.  The format
 follows Keep a Changelog.
 
+## [1.4.0] - 2026-10-24
+
+Additive release: restart is 1.35x faster and no longer replays records
+that a segment already holds, and the manifest gained a checkpoint
+watermark.
+
+### Added
+
+- **`WAL.iter_replay()`**: replay yields operations as they are decoded,
+  instead of materialising the whole log first.
+- **`MemTable.load()`**: bulk insertion for recovery, without the
+  per-record lock or incremental size bookkeeping -- 20 000 records used to
+  take 20 000 lock acquisitions and 40 000 size computations.
+- **A checkpoint watermark.** Each segment records the highest WAL sequence
+  number its contents came from, the manifest writes it per segment
+  (`seg-000009.sst 12`), and open deletes WALs at or below it without
+  replaying them.  This is the crash window between "manifest updated" and
+  "WAL unlinked"; without it those records are re-replayed on every start.
+- `restart_checkpointed` benchmark scenario, and `profile_restart.py`.
+
+### Changed
+
+- Replaying 20 000 records went from 0.061 s to 0.045 s (function calls
+  280 477 to 180 450); reopening the benchmark store from 0.0084 s to
+  0.0080 s, and 0.0038 s once `flush()` has emptied the WAL.
+- `decode_wal_record` takes an optional `limit`, removing 40 000 `len()`
+  calls per replay.
+- `stats()` reports `checkpoint_wal_seq`.
+- 124 tests (was 119).
+
+### Measured and rejected
+
+- Rolling the record checksum over header, key and value separately
+  tripled the `zlib.crc32` calls (20 002 to 60 002) and made replay slower
+  (0.051 s to 0.055 s).  The same lesson as the v1.1 encoder, measured
+  again, reverted again.
+
+### Compatibility
+
+- `MANIFEST` moved to `minikv-manifest-v2`.  A v1 manifest is treated as
+  damaged: it is rebuilt from the directory and rewritten, which replays
+  every WAL once.  No data is lost, and the failure mode is a slower start.
+
 ## [1.3.0] - 2026-10-24
 
 Additive release: point reads are 4x faster than 1.2, the test suite gained

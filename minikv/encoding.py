@@ -133,25 +133,33 @@ def encode_wal_record(rec_type: int, key: bytes = b"", value: bytes = b"") -> by
     return WAL_CRC.pack(crc32(body)) + body
 
 
-def decode_wal_record(buf, offset: int) -> tuple[int, bytes, bytes, int]:
+def decode_wal_record(buf, offset: int, limit: int | None = None) -> tuple[int, bytes, bytes, int]:
     """Decode the record at 'offset'.
 
     Returns (type, key, value, next_offset).  Raises IncompleteRecordError
     when the buffer ends mid-record (a torn tail) and CorruptRecordError
     when the CRC does not match.  'buf' may be bytes, bytearray or a
     memoryview, so a replay loop can parse a reused buffer in place.
+    'limit' is len(buf) when the caller already knows it; replay hands it in
+    because it decodes tens of thousands of records per chunk.
+
+    The checksum is taken over one contiguous slice for the same reason the
+    encoder builds one payload: rolling it over header, key and value
+    separately triples the zlib calls and measured slower, twice (v1.1 and
+    v1.4).  See BENCHMARKS.md.
     """
-    if offset + WAL_HEADER.size > len(buf):
+    if limit is None:
+        limit = len(buf)
+    if offset + WAL_HEADER.size > limit:
         raise IncompleteRecordError("torn WAL header")
     crc, rec_type, klen, vlen = WAL_HEADER.unpack_from(buf, offset)
     start = offset + WAL_HEADER.size
     end = start + klen + vlen
-    if end > len(buf):
+    if end > limit:
         raise IncompleteRecordError("torn WAL body")
     key = bytes(buf[start : start + klen])
     value = bytes(buf[start + klen : end])
-    body = memoryview(buf)[offset + 4 : end]
-    if crc32(body) != crc:
+    if crc32(memoryview(buf)[offset + 4 : end]) != crc:
         raise CorruptRecordError(f"WAL record at offset {offset} failed CRC")
     return rec_type, key, value, end
 

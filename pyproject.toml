@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "minikv"
-version = "1.3.0"
+version = "1.4.0"
 description = "A small, auditable LSM-style embedded key-value store (standard library only)."
 readme = "README.md"
 requires-python = ">=3.9"

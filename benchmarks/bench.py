@@ -151,6 +151,27 @@ def scenario_restart(root, ops, value):
     return elapsed, wal_bytes
 
 
+def scenario_restart_checkpointed(root, ops, value):
+    """Reopen after a flush(): the WAL is empty, so nothing is replayed."""
+    db = new_dir(root, "restart_checkpointed")
+    shutil.rmtree(db, ignore_errors=True)
+    os.makedirs(db)
+    store = Store(db, sync="never", memtable_bytes=128 << 20)
+    for i in range(ops):
+        store.put(key_for(i), value)
+    store.flush()
+    wal_bytes = sum(
+        os.path.getsize(os.path.join(db, name)) for name in os.listdir(db) if name.endswith(".log")
+    )
+    store.close()
+    started = time.perf_counter()
+    reopened = Store(db, sync="never", memtable_bytes=128 << 20)
+    elapsed = time.perf_counter() - started
+    assert reopened.get(key_for(ops - 1)) == value
+    reopened.close()
+    return elapsed, wal_bytes
+
+
 def scenario_compact(root, ops, value):
     db = new_dir(root, "compact")
     shutil.rmtree(db, ignore_errors=True)
@@ -289,6 +310,19 @@ def run_store_suite(ops, value_size, runs, root):
     out["restart_recovery"] = summarize(
         samples,
         unit=f"{ops} WAL records",
+        wal_bytes=int(statistics.median(wal_sizes)),
+    )
+
+    samples, wal_sizes = [], []
+    for run in range(runs):
+        elapsed, wal_bytes = scenario_restart_checkpointed(
+            os.path.join(root, f"checkpoint_{run}"), ops, value
+        )
+        samples.append(elapsed)
+        wal_sizes.append(wal_bytes)
+    out["restart_checkpointed"] = summarize(
+        samples,
+        unit=f"{ops} keys, flushed before close",
         wal_bytes=int(statistics.median(wal_sizes)),
     )
 

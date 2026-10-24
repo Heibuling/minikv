@@ -63,9 +63,8 @@ CRC32 on every record, block, index and bloom filter; nothing is pickled.
 | Surviving damage to a *length* field mid-WAL | indistinguishable from a torn tail; the file is truncated there |
 | Reclaiming disk while a snapshot is held | the files return when the last reader lets go |
 
-Keys are limited to 64 KiB and values to 16 MiB, rejected with `ValueError`
-before anything is written; empty keys and values are legal. One writer,
-one process: the second opener of a directory fails.
+Keys are capped at 64 KiB and values at 16 MiB, rejected with `ValueError`
+before anything is written; empty keys are legal, and one process only.
 
 ## Durability modes
 
@@ -76,7 +75,7 @@ one process: the second opener of a directory fails.
 | `never` | never | safe | may lose the tail |
 
 A Windows process cannot fsync a directory, so a segment rename is only as
-durable as NTFS itself: `stats()` reports `fsync_dir_supported: False`.
+durable as NTFS itself; `stats()` says so.
 
 ## Benchmarks (this machine, 5 000 ops, 3 runs, median)
 
@@ -87,25 +86,26 @@ durable as NTFS itself: `stats()` reports `fsync_dir_supported: False`.
 | point read, hot set | 0.012 s | 0.006 s | 2.1x |
 | point read, miss | 0.006 s | 0.004 s | 1.5x |
 | full scan | 0.006 s | 0.002 s | 2.9x |
-| restart, 5 000 WAL records | 0.008 s | 0.001 s | 8.2x |
+| restart, 5 000 WAL records | 0.008 s | 0.001 s | 7.0x |
 | compaction, 76 segments | 0.074 s | merge alone: 0.026 s | -- |
 
-SQLite is a C library with a page cache and years of tuning; the remaining
-gap is the interpreter, one Python object per record and one syscall each.
+SQLite is a C library with a page cache and years of tuning; the gap is
+the interpreter, one object per record and one syscall each.  `flush()`
+checkpoints the WAL, taking restart from 0.008 s to 0.004 s.
 
 ## When you should not use it
 
 - You need durability, concurrency or support: use `sqlite3`, which is
   better at all of this and ships with Python.
 - You need more than one writer or process, or values over 16 MiB.
-- You need compaction to run in the background: it is manual.
+- You need compaction, or crash recovery, to be automatic: both are manual.
 
 ## Design and documentation
 
 - DESIGN.md -- why an LSM tree, fsync costs, the concurrency model and the
   trade-offs, each with measurements.
 - BENCHMARKS.md -- method, numbers, three optimization cycles.
-- docs/crash-consistency.md -- invariants, fault model, injection method.
+- docs/crash-consistency.md, docs/format.md -- invariants and byte layouts.
 - CONTRIBUTING.md, SECURITY.md, CHANGELOG.md
 
 ## Development

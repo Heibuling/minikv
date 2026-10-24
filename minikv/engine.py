@@ -68,10 +68,10 @@ from .errors import ClosedStoreError, CorruptRecordError, StoreLockedError
 from .faults import fault_point
 from .memtable import TOMBSTONE, MemTable
 from .segment import DEFAULT_BLOCK_BYTES, BlockCache, SegmentReader, fsync_dir, write_segment
-from .wal import SYNC_MODES, WAL, IntervalSyncer, warn_corruption
+from .wal import SYNC_MODES, WAL, IntervalSyncer, ReplayResult, warn_corruption
 
 MANIFEST_NAME = "MANIFEST"
-MANIFEST_MAGIC = "minikv-manifest-v1"
+MANIFEST_MAGIC = "minikv-manifest-v2"
 LOCK_NAME = "LOCK"
 
 
@@ -206,7 +206,20 @@ class Store:
             self._seq = self._max_sequence()
 
             self._memtable = MemTable()
-            wal_paths = sorted(glob.glob(os.path.join(self.path, "wal-*.log")))
+            # A segment records the highest WAL sequence its contents came
+            # from.  Anything at or below the watermark is already on disk in
+            # a segment, so replaying it would only rebuild data we already
+            # have -- it is the crash window between "manifest updated" and
+            # "WAL unlinked", and it grows if an unlink ever fails.
+            watermark = max((reader.wal_seq for reader in self._segments), default=0)
+            self.checkpoint_wal_seq = watermark
+            wal_paths = []
+            for candidate in sorted(glob.glob(os.path.join(self.path, "wal-*.log"))):
+                if self._wal_seq(candidate) <= watermark:
+                    with contextlib.suppress(OSError):
+                        os.unlink(candidate)
+                    continue
+                wal_paths.append(candidate)
             for wal_path in wal_paths:
                 self._replay_wal(wal_path)
 
@@ -237,6 +250,13 @@ class Store:
     def _segment_path(self, seq: int) -> str:
         return os.path.join(self.path, f"seg-{seq:06d}.sst")
 
+    @staticmethod
+    def _wal_seq(path: str) -> int:
+        """The sequence number encoded in a wal-NNNNNN.log file name."""
+        name = os.path.basename(path)
+        digits = name[4:10]
+        return int(digits) if digits.isdigit() else 0
+
     def _manifest_path(self) -> str:
         return os.path.join(self.path, MANIFEST_NAME)
 
@@ -254,7 +274,15 @@ class Store:
 
     # -- manifest --------------------------------------------------------
 
-    def _read_manifest(self) -> list[str] | None:
+    def _read_manifest(self) -> list[tuple[str, int]] | None:
+        """Return (segment name, WAL coverage) newest first, or None.
+
+        A v1 manifest (no coverage column) and a damaged one are both
+        treated as "unknown": the live set is rebuilt from the directory
+        with coverage 0, which means nothing is skipped and every WAL is
+        replayed.  That is slower and always safe, which is the right way
+        round.
+        """
         try:
             with open(self._manifest_path(), encoding="utf-8") as handle:
                 text = handle.read()
@@ -276,11 +304,20 @@ class Store:
             warnings.warn("minikv: MANIFEST failed its checksum; rebuilding from the directory",
                           RuntimeWarning, stacklevel=2)
             return None
-        return lines[1:-1]
+        listed: list[tuple[str, int]] = []
+        for line in lines[1:-1]:
+            name, _, coverage = line.partition(" ")
+            try:
+                wal_seq = int(coverage)
+            except ValueError:
+                wal_seq = 0
+            listed.append((name, wal_seq))
+        return listed
 
     def _write_manifest(self) -> None:
-        names = [reader.name for reader in self._segments]
-        body = MANIFEST_MAGIC + "\n" + "".join(f"{name}\n" for name in names)
+        body = MANIFEST_MAGIC + "\n" + "".join(
+            f"{reader.name} {reader.wal_seq}\n" for reader in self._segments
+        )
         payload = body + f"crc32 {crc32(body.encode('utf-8')):08x}\n"
         manifest = self._manifest_path()
         temporary = manifest + ".tmp"
@@ -301,33 +338,49 @@ class Store:
         }
         listed = self._read_manifest()
         if listed is None:
-            names = sorted(on_disk, reverse=True)  # newest first
+            entries = [(name, 0) for name in sorted(on_disk, reverse=True)]  # newest first
         else:
-            missing = [name for name in listed if name not in on_disk]
+            missing = [name for name, _ in listed if name not in on_disk]
             if missing:
                 raise CorruptRecordError(f"MANIFEST lists missing segment(s): {missing}")
-            names = listed
+            entries = listed
 
-        for stale in on_disk - set(names):
+        for stale in on_disk - {name for name, _ in entries}:
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(self.path, stale))
 
-        readers = [SegmentReader(os.path.join(self.path, name), self._block_cache) for name in names]
+        readers = []
+        for name, wal_seq in entries:
+            reader = SegmentReader(os.path.join(self.path, name), self._block_cache)
+            reader.wal_seq = wal_seq
+            readers.append(reader)
         self._segments = tuple(readers)
         self._write_manifest()
         return readers
 
     def _replay_wal(self, path: str) -> None:
-        result = WAL.replay(path)
-        if result.problem is not None:
+        """Apply a WAL to the memtable as its records are decoded.
+
+        Streaming matters here: the previous version materialised every
+        record into a list first, so a 20 000-record log became 20 000
+        tuples before the first one was applied.
+        """
+        state = ReplayResult()
+        self._memtable.load(self._memtable_items(WAL.iter_replay(path, state)))
+        if state.problem is not None:
             self._corruption_events += 1
-            WAL.truncate_to(path, result.valid_bytes)
-            warn_corruption(path, result.problem, result.valid_bytes, result.file_bytes)
-        for rec_type, key, value in result.entries:
+            WAL.truncate_to(path, state.valid_bytes)
+            warn_corruption(path, state.problem, state.valid_bytes, state.file_bytes)
+
+    @staticmethod
+    def _memtable_items(
+        operations: Iterator[tuple[int, bytes, bytes]],
+    ) -> Iterator[tuple[bytes, object]]:
+        for rec_type, key, value in operations:
             if rec_type == WAL_TYPE_PUT:
-                self._memtable.put(key, value)
+                yield key, value
             elif rec_type == WAL_TYPE_DELETE:
-                self._memtable.delete(key)
+                yield key, TOMBSTONE
             else:  # pragma: no cover - replay only yields known types
                 raise CorruptRecordError(f"unknown WAL record type {rec_type}")
 
@@ -407,6 +460,7 @@ class Store:
                 try:
                     write_segment(segment_path, frozen.items_sorted(), len(frozen), self.block_bytes)
                     reader = SegmentReader(segment_path, self._block_cache)
+                    reader.wal_seq = max((self._wal_seq(path) for path in wal_paths), default=0)
                 except BaseException:
                     with self._lock:
                         self._pending.insert(0, (frozen, wal_paths))
@@ -649,6 +703,7 @@ class Store:
             try:
                 merge_segments(readers, output, self.block_bytes)
                 merged = SegmentReader(output, self._block_cache)
+                merged.wal_seq = max((reader.wal_seq for reader in readers), default=0)
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.unlink(output)
@@ -754,6 +809,7 @@ class Store:
             "segment_bytes": segment_bytes,
             "wal_bytes": wal_bytes,
             "pending_flushes": len(self._pending),
+            "checkpoint_wal_seq": max((reader.wal_seq for reader in snapshot.segments), default=0),
             "deferred_deletes": len(self._retired),
             "live_snapshots": self._live_snapshots,
             "block_cache_bytes": self.block_cache_bytes,

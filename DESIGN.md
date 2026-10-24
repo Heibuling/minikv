@@ -333,6 +333,28 @@ slower (0.0265 s to 0.069 s), because merging 76 segments pushed every
 block through the cache and evicted the working set for no benefit.  Full
 sequential scans now bypass it deliberately.
 
+### 7.7 A checkpoint watermark, so replay does not repeat itself
+
+Recovery has to replay whatever has not been flushed.  Two changes reduce
+that work without weakening anything:
+
+- A segment records the highest WAL sequence number its contents came
+  from, and the manifest carries it per segment (`seg-000009.sst 12`).  A
+  WAL at or below the watermark is deleted rather than replayed.  In steady
+  state a WAL is unlinked the moment its segment is durable, so this only
+  covers the crash window between those two steps -- but without it that
+  window re-replays the same records on every start, and would keep doing
+  so for as long as an unlink kept failing.
+- If the manifest is missing or damaged, the watermark is 0, which means
+  replay everything.  The failure mode is a slow start, never a missing
+  record.
+
+The remaining cost is inherent: a store whose memtable never reached the
+threshold has its whole WAL to replay.  `flush()` is the checkpoint that
+bounds it.  Streaming replay and a bulk memtable load (no per-record lock,
+no materialised list of every record) took 20 000 records from 0.061 s to
+0.045 s, and reopening after a checkpoint costs 0.0038 s.
+
 ## 8. Known limitations
 
 - **Compaction rewrites everything.** It no longer holds the writer lock
@@ -352,10 +374,15 @@ sequential scans now bypass it deliberately.
   reader.
 - **Reverse scans decode a block forward and then walk it backwards.** They
   stream and honour `limit`, but they are not the cheapest traversal.
-- **Recovery still reads every WAL record.** Streaming replay removed the
-  unbounded-memory failure mode, not the time: reopening 5 000 records
-  takes 0.008 s against SQLite's 0.001 s, and improving that needs a
-  checkpoint rather than a faster loop.
+- **Recovery replays the un-flushed tail.** Streaming removed the
+  bounded-memory problem, and the checkpoint removes the redundant replay,
+  but a store that never flushed still has its whole WAL to read: 5 000
+  records cost 0.008 s against SQLite's 0.001 s.  Only `flush()` reduces
+  that, which is why it is documented as the checkpoint.
+- **MANIFEST v1 is not read.** The format moved to v2 when WAL coverage was
+  added; a v1 manifest is treated as damaged, rebuilt from the directory
+  and rewritten, which replays every WAL once.  Started, not silently
+  wrong.
 - **No checksums on the manifest's meaning**, only on its bytes: a
   manifest that is valid but lists the wrong generation cannot be
   detected. It is written only after the segments it lists are durable.

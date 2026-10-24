@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import warnings
 
 import pytest
 
@@ -187,6 +188,62 @@ def test_key_and_value_limits_are_enforced(store):
     # the documented limits themselves are legal
     store.put(b"k" * MAX_KEY_BYTES, b"")
     assert store.get(b"k" * MAX_KEY_BYTES) == b""
+
+
+def test_manifest_records_wal_coverage(db_path):
+    instance = Store(db_path, sync="never", memtable_bytes=1 << 20)
+    instance.put(b"a", b"1")
+    instance.flush()
+    assert instance.stats()["checkpoint_wal_seq"] > 0
+
+    manifest = pathlib.Path(db_path, "MANIFEST").read_text(encoding="utf-8")
+    lines = manifest.splitlines()
+    assert lines[0] == "minikv-manifest-v2"
+    assert any(len(line.split()) == 2 and line.split()[1].isdigit() for line in lines[1:-1])
+    instance.close()
+
+
+def test_a_wal_covered_by_a_segment_is_not_replayed(db_path):
+    """The checkpoint: a WAL whose data is already in a segment is skipped.
+
+    This is the crash window -- the manifest was updated but the process
+    died before unlinking the WAL.  Putting a deliberately damaged file
+    back under a covered sequence number proves it is not read at all: if
+    it were replayed it would raise a corruption warning, and this test
+    turns warnings into errors.
+    """
+    instance = Store(db_path, sync="never", memtable_bytes=1 << 20)
+    for i in range(50):
+        instance.put(f"k{i:04d}".encode(), b"value")
+    before = {name for name in os.listdir(db_path) if name.startswith("wal-")}
+    instance.flush()
+    after = {name for name in os.listdir(db_path) if name.startswith("wal-")}
+    covered = (before - after).pop()
+    instance.close()
+
+    damaged = pathlib.Path(db_path, covered)
+    damaged.write_bytes(b"this would fail a CRC check if it were replayed")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        reopened = Store(db_path, sync="never", memtable_bytes=1 << 20)
+    assert not damaged.exists(), "a covered WAL should be deleted, not kept"
+    assert reopened.stats()["corruption_events"] == 0
+    assert reopened.get(b"k0000") == b"value"
+    reopened.close()
+
+
+def test_a_wal_above_the_watermark_is_replayed(db_path):
+    instance = Store(db_path, sync="never", memtable_bytes=1 << 20)
+    instance.put(b"early", b"1")
+    instance.flush()
+    instance.put(b"late", b"2")
+    instance.close()
+
+    reopened = Store(db_path, sync="never", memtable_bytes=1 << 20)
+    assert reopened.get(b"early") == b"1"
+    assert reopened.get(b"late") == b"2"
+    reopened.close()
 
 
 def test_verify_reports_a_healthy_store(store):

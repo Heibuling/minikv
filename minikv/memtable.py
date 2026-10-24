@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import bisect
 import threading
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 _ABSENT = object()
 
@@ -86,6 +86,30 @@ class MemTable:
                 self._keys = None
             else:
                 self._bytes += entry_size(key, TOMBSTONE) - entry_size(key, old)
+
+    def load(self, items: Iterable[tuple[bytes, object]]) -> None:
+        """Insert many entries at once, for recovery only.
+
+        Recovery is single-threaded -- the store holds the directory lock
+        and has not published this memtable to a reader yet -- so the
+        per-record lock and the incremental size bookkeeping are pure
+        overhead.  A 20 000-record replay used to take 20 000 lock
+        acquisitions and 40 000 entry_size() calls.
+        """
+        data = self._data
+        added = 0
+        for key, value in items:
+            old = data.get(key, _ABSENT)
+            data[key] = value
+            payload = 0 if value is TOMBSTONE else len(value)  # type: ignore[arg-type]
+            if old is _ABSENT:
+                added += len(key) + payload + 16
+            else:
+                old_payload = 0 if old is TOMBSTONE else len(old)  # type: ignore[arg-type]
+                added += payload - old_payload
+        with self._lock:
+            self._bytes += added
+            self._keys = None
 
     def clear(self) -> None:
         with self._lock:

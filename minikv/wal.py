@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import threading
 import warnings
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 from .encoding import (
@@ -56,6 +57,7 @@ class ReplayResult:
     entries: list[tuple[int, bytes, bytes]] = field(default_factory=list)
     valid_bytes: int = 0
     file_bytes: int = 0
+    records: int = 0
     problem: str | None = None  # "torn" | "corrupt" | None
 
 
@@ -107,32 +109,32 @@ class WAL:
     # -- replay ----------------------------------------------------------
 
     @staticmethod
-    def replay(path: str, chunk_bytes: int = DEFAULT_REPLAY_CHUNK) -> ReplayResult:
-        """Read a WAL file in chunks, stopping at the first bad record.
+    def iter_replay(
+        path: str,
+        state: ReplayResult | None = None,
+        chunk_bytes: int = DEFAULT_REPLAY_CHUNK,
+    ) -> Iterator[tuple[int, bytes, bytes]]:
+        """Yield (type, key, value) as records are decoded.
 
-        Returns every complete record plus the byte length that verified --
-        before the damage -- so the caller can truncate the file to that
-        point.  Nothing after the first torn or corrupt record is decoded.
+        Batches are expanded, so a caller sees operations, not frames.
+        'state' collects the outcome: 'problem' and 'valid_bytes' are only
+        final once the iterator is exhausted, and recovery is the caller
+        that does exhaust it.  Recovery applies records as they arrive, so
+        it never materialises a whole log -- a 20 000-record WAL used to
+        become 20 000 tuples before the first one was applied.
         """
-        result = ReplayResult()
+        if state is None:
+            state = ReplayResult()
         try:
-            result.file_bytes = os.path.getsize(path)
+            state.file_bytes = os.path.getsize(path)
         except OSError:
-            return result
-        if result.file_bytes == 0:
-            return result
+            return
+        if state.file_bytes == 0:
+            return
 
         buffer = bytearray()
         consumed = 0
         problem: str | None = None
-
-        def emit(rec_type: int, key: bytes, value: bytes) -> None:
-            if rec_type == WAL_TYPE_BATCH:
-                result.entries.extend(decode_batch(value))
-            elif rec_type in (WAL_TYPE_PUT, WAL_TYPE_DELETE):
-                result.entries.append((rec_type, key, value))
-            else:
-                raise CorruptRecordError(f"unknown WAL record type {rec_type}")
 
         with open(path, "rb") as handle:
             while True:
@@ -140,19 +142,30 @@ class WAL:
                 if not chunk:
                     break
                 buffer += chunk
+                limit = len(buffer)
                 offset = 0
                 broken = False
                 while True:
                     try:
-                        rec_type, key, value, next_offset = decode_wal_record(buffer, offset)
+                        rec_type, key, value, next_offset = decode_wal_record(buffer, offset, limit)
                     except IncompleteRecordError:
                         break
                     except CorruptRecordError:
                         broken = True
                         break
-                    try:
-                        emit(rec_type, key, value)
-                    except CorruptRecordError:
+                    if rec_type == WAL_TYPE_BATCH:
+                        try:
+                            operations = decode_batch(value)
+                        except CorruptRecordError:
+                            broken = True
+                            break
+                        for operation in operations:
+                            state.records += 1
+                            yield operation
+                    elif rec_type in (WAL_TYPE_PUT, WAL_TYPE_DELETE):
+                        state.records += 1
+                        yield rec_type, key, value
+                    else:
                         broken = True
                         break
                     offset = next_offset
@@ -164,8 +177,19 @@ class WAL:
 
         if problem is None and buffer:
             problem = "torn"
-        result.problem = problem
-        result.valid_bytes = consumed
+        state.problem = problem
+        state.valid_bytes = consumed
+
+    @staticmethod
+    def replay(path: str, chunk_bytes: int = DEFAULT_REPLAY_CHUNK) -> ReplayResult:
+        """Materialise every complete record of a WAL file.
+
+        Kept for callers that want the whole list -- verification and tests.
+        Recovery uses iter_replay() and applies records as they are decoded.
+        """
+        result = ReplayResult()
+        for operation in WAL.iter_replay(path, result, chunk_bytes):
+            result.entries.append(operation)
         return result
 
     @staticmethod

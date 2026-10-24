@@ -36,12 +36,17 @@ python benchmarks/measure_batch.py          # the fsync-batching number
   is revisited before it can be evicted; `scan_repeat` walks the whole
   range five times.  Both give minikv's 8 MiB block cache something to do,
   and SQLite's page cache the same opportunity.
+- `restart_recovery` closes a store whose writes all live in one WAL, so
+  the reopen replays them.  `restart_checkpointed` calls `flush()` first,
+  which moves the memtable into a segment and empties the WAL: the reopen
+  then has nothing to replay.  The pair is the cost of an un-checkpointed
+  tail.
 - `--block-cache-bytes 0` switches the cache off, which is how the
   cold-read columns in optimization 3 were produced.
 
 ## Results
 
-Canonical run: `benchmarks/results/bench-20261024T150821.json`.
+Canonical run: `benchmarks/results/bench-20261024T154709.json`.
 
 | Scenario | minikv median | sqlite3 median | minikv slower |
 | --- | --- | --- | --- |
@@ -52,17 +57,18 @@ Canonical run: `benchmarks/results/bench-20261024T150821.json`.
 | point read, miss | 0.006 s | 0.004 s | 1.5x |
 | full scan | 0.006 s | 0.002 s | 2.9x |
 | full scan, repeated 5x | 0.016 s | 0.010 s | 1.5x |
-| restart (5 000 WAL records) | 0.008 s | 0.001 s | 8.2x |
-| compaction (76 segments) | 0.074 s | not applicable | -- |
+| restart (5 000 WAL records) | 0.008 s | 0.001 s | 7.0x |
+| restart after a checkpoint | 0.004 s | not applicable | -- |
+| compaction (76 segments) | 0.076 s | not applicable | -- |
 
 Throughput equivalents: ~61 000 writes/s, ~340 000 warm point reads/s and
 ~790 000 rows/s on a full scan, single-threaded, with no fsync.
 
 Reproducibility: the second canonical run of the same build produced
-0.086 / 0.091 / 0.015 / 0.012 / 0.006 / 0.006 / 0.016 / 0.009 / 0.074 s
-for the same rows -- within 8% everywhere.  Random write is the row most
-sensitive to filesystem cache state, and fsync-bound timings are noisier
-still.
+0.083 / 0.092 / 0.015 / 0.012 / 0.006 / 0.006 / 0.016 / 0.008 / 0.004 /
+0.077 s for the same rows -- within 8% everywhere.  Random write is the
+row most sensitive to filesystem cache state, and fsync-bound timings are
+noisier still.
 
 Compaction deserves a footnote: 0.074 s is the merge *plus* reclaiming its
 76 inputs, which the v1.2 snapshot design now does eagerly.  Measured
@@ -173,6 +179,70 @@ The restart regression is the price of streaming WAL replay in 64 KiB
 chunks instead of reading the file whole: recovery must no longer hold an
 entire WAL in memory, which the earlier code did.  It is 0.9 ms on this
 workload, and it removes an unbounded-memory failure mode.
+
+## Optimization 4 (v1.4): restart -- stream the replay, and checkpoint the tail
+
+### What the profile said
+
+Reopening a store that holds 20 000 records in one WAL took 0.061 s:
+
+```
+ncalls  tottime  cumtime  function
+ 20038    0.018    0.027  encoding.py:136(decode_wal_record)
+ 20000    0.008    0.016  memtable.py:70(put)            <-- 20k locks
+ 20000    0.003    0.005  memtable.py:53(entry_size)
+ 20001    0.001    0.001  {method 'append' of 'list' objects}
+```
+
+Two things stood out.  Recovery materialised every record into a list
+before applying the first one, so a large log became tens of thousands of
+tuples first.  And it applied them through `MemTable.put`, which takes the
+memtable lock and recomputes sizes per record -- 20 000 lock acquisitions
+and 40 000 size computations for a pass that is single-threaded by
+construction.
+
+### Change 1: stream, and load in bulk
+
+`WAL.iter_replay()` yields operations as they are decoded, and
+`MemTable.load()` inserts a batch without per-record locking: recovery
+holds the directory lock and has not published the memtable yet, so the
+lock protects nothing.
+
+**0.061 s to 0.045 s** for 20 000 records, function calls 280 477 to
+180 450, and the memtable's share fell from 0.016 s to 0.007 s.
+
+### Change 2: a checkpoint watermark in the manifest
+
+A WAL whose contents are already inside a segment does not need replaying.
+Each segment now records the highest WAL sequence number it covers, the
+manifest carries that number per segment (`seg-000009.sst 12`), and open
+deletes any WAL at or below the watermark instead of replaying it.
+
+The case it fixes is the crash window between "manifest updated" and "WAL
+unlinked", which otherwise re-replays the same records on every start, and
+would keep doing so forever if an unlink ever failed.  If the manifest is
+missing or damaged the watermark is 0, which means replay everything --
+slower and always safe.
+
+### Change 3: bound the tail, and measure it
+
+The restart cost is however much WAL has not been flushed.  `flush()` is
+the checkpoint: it moves the memtable into a segment and empties the WAL.
+The benchmark now measures both sides of that:
+
+| | median | vs sqlite3 |
+| --- | --- | --- |
+| restart, 5 000 WAL records | 0.0080 s | 7.0x |
+| restart after `flush()` | 0.0038 s | -- |
+
+### A change that was measured and reverted, again
+
+Rolling the record checksum over header, key and value separately -- to
+avoid a third copy and a per-record memoryview -- tripled the `zlib.crc32`
+calls (20 002 to 60 002) and moved the whole replay from 0.051 s to
+0.055 s.  The same lesson as the encoder in v1.1, measured a second time,
+and reverted again.  What stayed is the `limit` argument, which removed
+40 000 `len()` calls per run.
 
 ## Optimization 3 (v1.3): point reads -- stop at the key, then cache the block
 
@@ -312,8 +382,10 @@ goes flat.
 - `benchmarks/bench.py` -- the main suite.
 - `benchmarks/measure_batch.py` -- the batch-size sweep (writes
   `batch-curve-<stamp>.json`).
-- `benchmarks/profile_reads.py`, `benchmarks/profile_writes.py` -- cProfile runs.
-- `benchmarks/results/bench-20261024T150821.json` -- canonical run (v1.3).
+- `benchmarks/profile_reads.py`, `profile_writes.py`, `profile_restart.py` -- cProfile runs.
+- `benchmarks/results/bench-20261024T154709.json` -- canonical run (v1.4).
+- `benchmarks/results/bench-20261024T154715.json` -- its repeat.
+- `benchmarks/results/bench-20261024T150821.json` -- v1.3 run quoted above.
 - `benchmarks/results/bench-20261024T150826.json` -- its repeat.
 - `benchmarks/results/bench-20261024T150924.json` -- the same build with the
   block cache off, quoted in optimization 3.
@@ -321,4 +393,5 @@ goes flat.
 - `benchmarks/results/bench-20261024T123518.json` -- its repeat.
 - `benchmarks/results/bench-20261024T114414.json` -- v1.0 run quoted above.
 - `benchmarks/results/batch-curve-20261024T142842.json` -- the sweep above.
-- `benchmarks/results/profile-reads.txt`, `profile-writes.txt` -- raw cProfile output.
+- `benchmarks/results/profile-reads.txt`, `profile-writes.txt`,
+  `profile-restart.txt` -- raw cProfile output.

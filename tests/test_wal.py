@@ -9,7 +9,7 @@ import os
 import pytest
 
 from minikv.encoding import WAL_TYPE_DELETE, WAL_TYPE_PUT
-from minikv.wal import WAL
+from minikv.wal import WAL, ReplayResult
 
 
 def test_append_and_replay_roundtrip(tmp_path):
@@ -104,6 +104,24 @@ def test_close_is_idempotent(tmp_path):
     wal = WAL(str(tmp_path / "wal-000001.log"), sync="never")
     wal.close()
     wal.close()
+
+
+def test_streaming_replay_matches_the_materialised_one(tmp_path):
+    path = str(tmp_path / "wal-000001.log")
+    wal = WAL(path, sync="never")
+    for i in range(200):
+        wal.append_put(f"k{i:04d}".encode(), b"v" * (i % 30))
+    wal.append_delete(b"k0000")
+    wal.append_batch([(WAL_TYPE_PUT, b"batch", b"1"), (WAL_TYPE_DELETE, b"k0001", b"")])
+    wal.close()
+
+    whole = WAL.replay(path)
+    state = ReplayResult()
+    streamed = list(WAL.iter_replay(path, state))
+    assert streamed == whole.entries
+    assert state.problem is None
+    assert state.valid_bytes == whole.valid_bytes
+    assert state.records == len(whole.entries)
 
 
 def test_invalid_sync_mode_is_rejected(tmp_path):

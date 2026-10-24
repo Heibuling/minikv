@@ -332,6 +332,10 @@ class SegmentReader:
         self._bloom = _Bloom.from_bytes(bloom_bytes)
         # One cached handle serves the point-read path: opening a file per
         # get() costs ~90 us on Windows and dominated every read benchmark.
+        #: Highest WAL sequence number whose contents this segment holds.
+        #: Set by the store when the segment is created or loaded; 0 means
+        #: "unknown", which makes recovery replay everything (always safe).
+        self.wal_seq = 0
         self._handle = None
         self._io_lock = threading.Lock()
         self._closed = False

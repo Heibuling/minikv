@@ -63,6 +63,25 @@ def test_items_sorted_includes_tombstones():
     assert list(table.items_sorted()) == [(b"a", b"1"), (b"b", TOMBSTONE)]
 
 
+def test_bulk_load_matches_repeated_puts():
+    items = [(b"a", b"1"), (b"b", b"2"), (b"a", b"3"), (b"c", TOMBSTONE)]
+
+    one = MemTable()
+    for key, value in items:
+        if value is TOMBSTONE:
+            one.delete(key)
+        else:
+            one.put(key, value)
+
+    other = MemTable()
+    other.load(iter(items))
+
+    assert list(one.items_sorted()) == list(other.items_sorted())
+    assert one.approx_bytes == other.approx_bytes
+    assert one.get(b"a") == b"3"
+    assert one.get(b"c") is TOMBSTONE
+
+
 def test_clear_resets_everything():
     table = MemTable()
     table.put(b"a", b"1")
