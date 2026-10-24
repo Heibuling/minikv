@@ -49,6 +49,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import heapq
+import importlib
 import itertools
 import os
 import threading
@@ -129,16 +130,20 @@ class _DirectoryLock:
             if os.fstat(fd).st_size == 0:
                 os.write(fd, b"\n")
             if os.name == "nt":
-                import msvcrt
+                msvcrt = importlib.import_module("msvcrt")
 
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
             else:
-                import fcntl
+                # Imported by name rather than by statement, and deliberately
+                # not annotated: mypy resolves modules for the platform it
+                # runs on, so a static fcntl import type-checks on Linux and
+                # fails on Windows (and the reverse for msvcrt).  Importing
+                # dynamically keeps the checker platform-independent instead
+                # of pinning it to whatever host CI happens to use.
+                fcntl = importlib.import_module("fcntl")
 
-                # typeshed's fcntl stub has no locking attributes on this
-                # platform; the branch only runs on POSIX.
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             os.close(fd)
             raise StoreLockedError(
@@ -159,14 +164,12 @@ class _DirectoryLock:
             return
         try:
             if os.name == "nt":
-                import msvcrt
+                msvcrt = importlib.import_module("msvcrt")
 
                 os.lseek(fd, 0, os.SEEK_SET)
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
             else:
-                import fcntl
-
-                fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+                importlib.import_module("fcntl").flock(fd, importlib.import_module("fcntl").LOCK_UN)
         except OSError:  # pragma: no cover - unlock failures are not fatal
             pass
         finally:

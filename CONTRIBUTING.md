@@ -22,6 +22,15 @@ modelled as `Value = bytes | Tombstone` rather than `object`, and why a
 reader narrows with `isinstance` instead of comparing against the
 sentinel: only the former tells the checker anything.
 
+`mypy` resolves modules for the platform it runs on, so if you touch
+platform-specific code, check the other platforms too -- this bit CI
+once, passing on Windows and failing on Linux and macOS:
+
+```
+mypy --platform linux
+mypy --platform darwin
+```
+
 ## What a change needs to include
 
 - **A test that fails without it.**  Every guarantee in README.md has at

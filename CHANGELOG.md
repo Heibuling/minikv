@@ -34,6 +34,12 @@ was removed.
 
 ### Notes
 
+- CI caught something the local Windows checks could not: mypy resolves
+  modules for the platform it runs on, so a static `fcntl` import in the
+  directory lock type-checked on Linux and macOS and failed on Windows (and
+  `msvcrt` would do the reverse).  The lock now imports its platform module
+  by name, and CONTRIBUTING documents `mypy --platform linux` as part of
+  checking a change that touches platform-specific code.
 - mypy 2.x cannot analyse a 3.9 target, so the checker runs with
   python_version = "3.10".  Python 3.9 support is enforced by the CI
   matrix, which installs and runs the suite there; the checker's job is
