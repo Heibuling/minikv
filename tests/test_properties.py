@@ -3,17 +3,35 @@ random operations, across flushes, reopens and compactions."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import random
 import shutil
 import tempfile
 
-from hypothesis import given, settings
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, rule, run_state_machine_as_test
 
 from minikv import Store
 from minikv.encoding import WAL_TYPE_PUT, decode_wal_record, encode_wal_record
+from minikv.faults import InjectedFault
+from minikv.faults import reset as reset_faults
 from minikv.segment import SegmentReader, write_segment
+
+FLUSH_FAULTS = (
+    "segment_tmp_written",
+    "segment_renamed",
+    "manifest_before",
+    "manifest_after",
+    "wal_before_delete",
+    "wal_after_delete",
+)
+COMPACTION_FAULTS = ("compaction_merged", "compaction_manifest")
+
+#: Fault points the state machine actually reached, so a rule that never
+#: gets selected cannot pass unnoticed.
+EXERCISED_POINTS: set[str] = set()
 
 
 def reopen(db_path, store):
@@ -71,6 +89,149 @@ def test_random_scan_ranges_match_a_dict(db_path):
         expected = sorted((k, v) for k, v in oracle.items() if start <= k <= end)
         assert list(store.scan(start, end)) == expected
     store.close()
+
+
+class StoreStateMachine(RuleBasedStateMachine):
+    """Random operations, restarts and injected crashes against a dict.
+
+    The oracle comparison runs after every step, so a divergence is reported
+    against the rule that caused it, and hypothesis shrinks the sequence to
+    the shortest one that still fails.  Nothing here is mocked: each example
+    builds a real store in a temporary directory, flushes real segments and
+    reopens from disk.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._directory = tempfile.mkdtemp()
+        self._store = Store(self._directory, sync="never", memtable_bytes=1024, block_cache_bytes=64 << 10)
+        self.oracle: dict[bytes, bytes] = {}
+
+    # -- lifecycle -------------------------------------------------------
+
+    def teardown(self):
+        with contextlib.suppress(Exception):
+            self._store.close()
+        shutil.rmtree(self._directory, ignore_errors=True)
+
+    def _reopen(self):
+        self._store.close()
+        self._store = Store(self._directory, sync="never", memtable_bytes=1024, block_cache_bytes=64 << 10)
+        assert dict(self._store.scan()) == self.oracle
+
+    # -- rules -----------------------------------------------------------
+
+    @rule(key=st.binary(min_size=1, max_size=6), value=st.binary(max_size=32))
+    def put(self, key, value):
+        self._store.put(key, value)
+        self.oracle[key] = value
+
+    @rule(key=st.binary(min_size=1, max_size=6))
+    def delete(self, key):
+        self._store.delete(key)
+        self.oracle.pop(key, None)
+
+    @rule(
+        pairs=st.lists(
+            st.tuples(st.binary(min_size=1, max_size=6), st.binary(max_size=32)),
+            min_size=1,
+            max_size=5,
+        )
+    )
+    def batch(self, pairs):
+        with self._store.batch() as group:
+            for key, value in pairs:
+                group.put(key, value)
+                self.oracle[key] = value
+
+    @rule()
+    def flush(self):
+        self._store.flush()
+
+    @rule()
+    def compact(self):
+        if self._store.stats()["segments"] >= 2:
+            self._store.compact()
+
+    @rule()
+    def reopen(self):
+        self._reopen()
+
+    @rule(point=st.sampled_from(FLUSH_FAULTS))
+    def crash_during_flush(self, point):
+        """Kill the flush protocol at a named step, then recover.
+
+        The store writes with the fault action set to 'raise' so the process
+        survives and the test can reopen in-process; the on-disk state left
+        behind is the same one a real crash would leave.
+        """
+        self._wreck(point)
+
+    @rule(point=st.sampled_from(COMPACTION_FAULTS))
+    def crash_during_compaction(self, point):
+        if self._store.stats()["segments"] >= 2:
+            self._wreck(point)
+
+    def _wreck(self, point):
+        EXERCISED_POINTS.add(point)
+        os.environ["MINIKV_FAULT"] = point
+        os.environ["MINIKV_FAULT_ACTION"] = "raise"
+        reset_faults()
+        try:
+            for index in range(40):
+                key = f"crash-{point}-{index}".encode()
+                value = f"v{index}".encode()
+                try:
+                    self._store.put(key, value)
+                except InjectedFault:
+                    # The WAL record was written before the flush it triggered.
+                    self.oracle[key] = value
+                    break
+                self.oracle[key] = value
+        finally:
+            os.environ.pop("MINIKV_FAULT", None)
+            os.environ.pop("MINIKV_FAULT_ACTION", None)
+            reset_faults()
+        self._reopen()
+
+    # -- checks ----------------------------------------------------------
+
+    @invariant()
+    def matches_the_oracle(self):
+        assert dict(self._store.scan()) == self.oracle
+
+    @rule(start=st.binary(max_size=4), end=st.binary(max_size=4))
+    def reverse_scan_matches_the_oracle(self, start, end):
+        if start > end:
+            start, end = end, start
+        expected = [item for item in sorted(self.oracle.items()) if start <= item[0] <= end]
+        assert list(self._store.scan(start, end, reverse=True)) == list(reversed(expected))
+
+
+STATE_MACHINE_SETTINGS = settings(
+    max_examples=40,
+    stateful_step_count=20,
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+StoreStateMachine.TestCase.settings = STATE_MACHINE_SETTINGS
+TestStoreStateMachine = StoreStateMachine.TestCase
+
+
+def test_the_state_machine_really_injects_crashes():
+    """Guard: the crash rules must be selected, not silently skipped."""
+    EXERCISED_POINTS.clear()
+    run_state_machine_as_test(
+        StoreStateMachine,
+        settings=settings(
+            max_examples=30,
+            stateful_step_count=20,
+            deadline=None,
+            suppress_health_check=[HealthCheck.too_slow],
+        ),
+    )
+    assert EXERCISED_POINTS, "hypothesis never chose a crash rule"
+    assert set(FLUSH_FAULTS) | set(COMPACTION_FAULTS) >= EXERCISED_POINTS
 
 
 @settings(max_examples=100, deadline=None)

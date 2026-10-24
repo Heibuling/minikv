@@ -99,6 +99,38 @@ def scenario_scan(store_factory, ops, value, rnd):
         store.close()
 
 
+def scenario_read_hot(store_factory, ops, value, rnd, hot_size=200):
+    """Repeated reads over a small working set: the cache-friendly case."""
+    store = store_factory()
+    try:
+        for i in range(ops):
+            store.put(key_for(i), value)
+        hot = [key_for(i) for i in range(min(hot_size, ops))]
+        rnd.shuffle(hot)
+        probe = [hot[i % len(hot)] for i in range(ops)]
+        started = time.perf_counter()
+        for key in probe:
+            store.get(key)
+        return time.perf_counter() - started
+    finally:
+        store.close()
+
+
+def scenario_scan_repeat(store_factory, ops, value, passes=5):
+    """Scan the same range several times: blocks decoded once if cached."""
+    store = store_factory()
+    try:
+        for i in range(ops):
+            store.put(key_for(i), value)
+        started = time.perf_counter()
+        for _ in range(passes):
+            rows = sum(1 for _ in store.scan(b"", None))
+            assert rows == ops, (rows, ops)
+        return time.perf_counter() - started
+    finally:
+        store.close()
+
+
 def scenario_restart(root, ops, value):
     """Close a store holding 'ops' WAL records, then time opening it again."""
     db = new_dir(root, "restart")
@@ -232,6 +264,8 @@ def run_core_suite(backend, ops, value_size, runs, root):
         ("read_hit", lambda f, r: scenario_read(f, ops, value, r, True)),
         ("read_miss", lambda f, r: scenario_read(f, ops, value, r, False)),
         ("scan_full", lambda f, r: scenario_scan(f, ops, value, r)),
+        ("read_hot", lambda f, r: scenario_read_hot(f, ops, value, r)),
+        ("scan_repeat", lambda f, r: scenario_scan_repeat(f, ops, value)),
     ):
         samples = []
         for run in range(runs):
@@ -294,6 +328,12 @@ def main(argv=None):
     parser.add_argument("--ops", type=int, default=DEFAULT_OPS)
     parser.add_argument("--value-size", type=int, default=DEFAULT_VALUE_SIZE)
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
+    parser.add_argument(
+        "--block-cache-bytes",
+        type=int,
+        default=8 << 20,
+        help="minikv block cache budget; 0 disables it",
+    )
     parser.add_argument("--quick", action="store_true", help="40 ops, 1 run: a smoke test")
     parser.add_argument("--out", type=str, default=os.path.join(os.path.dirname(__file__), "results"))
     args = parser.parse_args(argv)
@@ -305,7 +345,12 @@ def main(argv=None):
     try:
         started = time.time()
         minikv_results = run_core_suite(
-            lambda path: Store(path, sync="never", memtable_bytes=64 << 10),
+            lambda path: Store(
+                path,
+                sync="never",
+                memtable_bytes=64 << 10,
+                block_cache_bytes=args.block_cache_bytes,
+            ),
             ops,
             args.value_size,
             runs,
@@ -331,7 +376,13 @@ def main(argv=None):
             "platform": platform.platform(),
             "processor": platform.processor(),
             "cpu_count": os.cpu_count(),
-            "config": {"ops": ops, "value_size": args.value_size, "runs": runs, "seed": 1234},
+            "config": {
+                "ops": ops,
+                "value_size": args.value_size,
+                "runs": runs,
+                "seed": 1234,
+                "block_cache_bytes": args.block_cache_bytes,
+            },
             "minikv": minikv_results,
             "sqlite3": sqlite_results,
         }

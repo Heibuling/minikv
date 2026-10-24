@@ -153,7 +153,21 @@ and every key that exists must be correct, and the keys after the first
 gap must be absent -- writes are sequential, so a surviving set that is
 not a prefix would indicate a torn record was decoded.
 
-### 4.4 Damage injection
+### 4.4 A stateful property test, crashes included
+
+`tests/test_properties.py` runs a hypothesis `RuleBasedStateMachine` whose
+rules are `put`, `delete`, `batch`, `flush`, `compact`, `reopen`,
+`crash_during_flush` and `crash_during_compaction`.  The oracle is a plain
+dict, compared against a full scan after *every* step, so a divergence is
+reported against the rule that caused it and hypothesis shrinks the
+sequence to the shortest failing one.
+
+The crash rules arm a fault point with `MINIKV_FAULT_ACTION=raise` so the
+process survives and the machine can reopen in-process; the on-disk state
+is the one a real kill would leave.  A separate test asserts that the
+crash rules were actually selected, so they cannot be silently skipped.
+
+### 4.5 Damage injection
 
 Corruption tests mutate real files in a real temporary directory; nothing
 is mocked:
@@ -180,9 +194,10 @@ literally.
 ## 6. Reproducing
 
 ```
-pytest tests/test_crash_recovery.py -q     # ~20 s, 140 kill points
+pytest tests/test_crash_recovery.py -q     # 140 kill points + 6 flush faults
 pytest tests/test_corruption.py -q         # ~2 s
-pytest -q                                  # 108 tests, ~33 s
+pytest tests/test_properties.py -q         # stateful machine + hypothesis
+pytest -q                                  # 119 tests, ~43 s
 pytest tests/test_compaction.py -q         # includes the soak and I5 tests
 ```
 

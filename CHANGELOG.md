@@ -3,6 +3,47 @@
 All notable changes to this project are documented here.  The format
 follows Keep a Changelog.
 
+## [1.3.0] - 2026-10-24
+
+Additive release: point reads are 4x faster than 1.2, the test suite gained
+a stateful model of the whole engine, and three measured changes are
+recorded (including one that was reverted).
+
+### Added
+
+- **A hypothesis state machine** (`tests/test_properties.py`): random
+  `put`/`delete`/`batch`/`flush`/`compact`/`reopen` plus two rules that
+  inject a crash at a named flush or compaction step, all compared against
+  a dict oracle after every step, with shrinking.  A guard test asserts the
+  crash rules are actually selected.
+- **`BlockCache`**: a bounded LRU of decoded, CRC-verified data blocks,
+  shared by a store's segments, 8 MiB by default and switchable off with
+  `block_cache_bytes=0` for cold-read measurement.
+- Two benchmark scenarios that the cache can help: `read_hot` (a 200-key
+  working set) and `scan_repeat` (the same range five times).
+
+### Changed
+
+- **Point reads are 4x faster**: 0.058 s to 0.015 s for 5 000 reads
+  (9.1x to 2.3x slower than SQLite).  `get()` stops at the key instead of
+  decoding the value of every record it walks past, and a warm block is
+  answered by a bisect over a decoded tuple.  With the cache off the same
+  build reads 0.046 s, so the cache is worth 3.1x on a full sweep.
+- Compaction reclaims its retired inputs before returning, outside the
+  writer lock: the merge is still 0.026 s, and the whole call is ~0.074 s
+  because unlinking 76 files costs ~275 us each here.
+- Point-read misses are 1.5x slower than SQLite instead of 1.1x, because
+  every read now holds a snapshot lease (about 0.3 us).  Documented rather
+  than hidden.
+- 119 tests (was 117), coverage 90.2% (was 87.7%).
+
+### Measured and rejected
+
+- Routing the sequential `items()` iterator through the block cache made
+  compaction 2.5x slower (0.0265 s to 0.069 s) by pushing every block of
+  every input segment through the cache.  Reverted; the reason is recorded
+  in the docstring and in BENCHMARKS.md.
+
 ## [1.2.0] - 2026-10-24
 
 Additive release: it makes the crash-consistency claims testable at every

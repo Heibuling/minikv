@@ -276,8 +276,11 @@ before compaction.
 
 The price is write amplification and disk headroom. On the benchmark
 workload 76 small segments (about 570 KiB of live data) are rewritten
-into one file in 0.026 s, i.e. every byte is read once and written once
-per compaction. A leveled design rewrites less per compaction but must
+into one file in 0.026 s -- every byte read once and written once per
+compaction -- and, since v1.2, `compact()` also reclaims its inputs
+eagerly when no snapshot holds them, which brings the whole call to about
+0.074 s.  The unlink itself costs ~275 us per file here; it happens outside
+the writer lock, so it delays the caller but not other writers. A leveled design rewrites less per compaction but must
 track overlapping key ranges, and tombstones can only be dropped at the
 bottom level.
 
@@ -300,6 +303,36 @@ The cost is one extra file in the directory and one open plus one lock per
 format rejects it; both limits raise `ValueError` before anything is
 written, and the documented boundaries are accepted.
 
+### 7.6 A block cache, and stopping at the key
+
+Point reads were 9.1x slower than SQLite after v1.2, and the profile put
+34% of the remaining time in `decode_sst_record`: 82 782 decodes for 5 000
+gets, 16.6 per lookup.  A 4 KiB block holds ~34 records, and the old code
+decoded every one of them completely -- key *and* value -- to compare keys
+it was about to skip.
+
+Two changes, measured separately:
+
+- `get()` now unpacks the record header, compares the key, and touches the
+  value only on a match.  A skipped record costs a header unpack and one
+  slice.  This needs no memory and no state.
+- `BlockCache` keeps decoded blocks as `(keys, entries)` tuples in a
+  bounded LRU (8 MiB by default), so a lookup inside a warm block is a
+  bisect over an in-memory tuple.  Cache entries are built only from bytes
+  that already passed their CRC: it caches *verified* data rather than
+  replacing verification, which is the opposite of the mmap trade
+  criticised in section 9.
+
+Warm point reads went from 0.058 s to 0.015 s for 5 000 (2.3x SQLite), and
+a hot working set to 0.012 s.  With the cache off the same build reads
+0.046 s, so the cache is worth 3.1x on a full sweep and 4.0x on a hot set.
+
+The cost is memory, and one measurement that changed the design: routing
+the sequential `items()` iterator through the cache made compaction 2.5x
+slower (0.0265 s to 0.069 s), because merging 76 segments pushed every
+block through the cache and evicted the working set for no benefit.  Full
+sequential scans now bypass it deliberately.
+
 ## 8. Known limitations
 
 - **Compaction rewrites everything.** It no longer holds the writer lock
@@ -310,6 +343,13 @@ written, and the documented boundaries are accepted.
 - **A leaked snapshot holds files open.** Reclamation depends on the last
   lease being released: a `StoreSnapshot` that is neither closed nor
   collected keeps its segments on disk and their handles open.
+- **The block cache costs 8 MiB by default** and is per store.  A working
+  set larger than the cache falls back to a full block decode, and the
+  cache is not shared between stores.
+- **A miss pays for the snapshot lease.** Two lock operations per read,
+  about 0.3 us, which is why point-read misses are 1.5x rather than 1.1x.
+  It buys the guarantee that compaction cannot unlink a file under a
+  reader.
 - **Reverse scans decode a block forward and then walk it backwards.** They
   stream and honour `limit`, but they are not the cheapest traversal.
 - **Recovery still reads every WAL record.** Streaming replay removed the

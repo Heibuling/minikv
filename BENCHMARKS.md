@@ -32,30 +32,43 @@ python benchmarks/measure_batch.py          # the fsync-batching number
   indexed read on the same 5 000 rows.
 - "Compaction" and "batch fsync" have no SQLite equivalent and are
   reported for minikv only.
+- `read_hot` reads 5 000 keys drawn from a 200-key working set, so a block
+  is revisited before it can be evicted; `scan_repeat` walks the whole
+  range five times.  Both give minikv's 8 MiB block cache something to do,
+  and SQLite's page cache the same opportunity.
+- `--block-cache-bytes 0` switches the cache off, which is how the
+  cold-read columns in optimization 3 were produced.
 
 ## Results
 
-Canonical run: `benchmarks/results/bench-20261024T123521.json`.
+Canonical run: `benchmarks/results/bench-20261024T150821.json`.
 
-| Scenario | minikv median | spread | sqlite3 median | spread | minikv slower |
-| --- | --- | --- | --- | --- | --- |
-| sequential write | 0.082 s | 3.1% | 0.006 s | 5.7% | 14.9x |
-| random write | 0.111 s | 20.2% | 0.006 s | 6.0% | 18.2x |
-| point read, hit | 0.058 s | 4.1% | 0.006 s | 4.9% | 9.1x |
-| point read, miss | 0.004 s | 0.9% | 0.004 s | 3.4% | 1.1x |
-| full scan | 0.006 s | 4.4% | 0.002 s | 2.0% | 2.7x |
-| restart (5 000 WAL records) | 0.008 s | 14.1% | 0.001 s | 8.0% | 10.9x |
-| compaction (76 segments) | 0.026 s | 13.2% | not applicable | -- | -- |
+| Scenario | minikv median | sqlite3 median | minikv slower |
+| --- | --- | --- | --- |
+| sequential write | 0.081 s | 0.006 s | 14.8x |
+| random write | 0.081 s | 0.006 s | 13.2x |
+| point read, hit | 0.015 s | 0.007 s | 2.3x |
+| point read, hot set | 0.012 s | 0.006 s | 2.1x |
+| point read, miss | 0.006 s | 0.004 s | 1.5x |
+| full scan | 0.006 s | 0.002 s | 2.9x |
+| full scan, repeated 5x | 0.016 s | 0.010 s | 1.5x |
+| restart (5 000 WAL records) | 0.008 s | 0.001 s | 8.2x |
+| compaction (76 segments) | 0.074 s | not applicable | -- |
 
-Throughput equivalents: ~61 000 writes/s, ~86 000 point reads/s and
-~1 160 000 probes/s for a key that does not exist, single-threaded, with
-no fsync.
+Throughput equivalents: ~61 000 writes/s, ~340 000 warm point reads/s and
+~790 000 rows/s on a full scan, single-threaded, with no fsync.
 
-Reproducibility: the preceding run
-(`bench-20261024T123518.json`) produced 0.081 / 0.083 / 0.059 / 0.004 /
-0.006 / 0.008 / 0.027 s for the same rows.  Every scenario is within 3%
-except random write, which varies by up to 20% on this machine (it is the
-row most sensitive to filesystem cache state), and fsync-bound timings.
+Reproducibility: the second canonical run of the same build produced
+0.086 / 0.091 / 0.015 / 0.012 / 0.006 / 0.006 / 0.016 / 0.009 / 0.074 s
+for the same rows -- within 8% everywhere.  Random write is the row most
+sensitive to filesystem cache state, and fsync-bound timings are noisier
+still.
+
+Compaction deserves a footnote: 0.074 s is the merge *plus* reclaiming its
+76 inputs, which the v1.2 snapshot design now does eagerly.  Measured
+separately, the merge alone is 0.0265 s (0.0276 / 0.0257 / 0.0265 over
+three runs) and the reclaim of 76 files is ~0.02 s on this machine, with
+`os.unlink` costing about 275 us per file.
 
 ### Why SQLite wins, and where it does not
 
@@ -68,14 +81,19 @@ per call.  minikv pays, per operation:
 - a dict lookup, or a block decode, per read;
 - one `write()` syscall per record.
 
-The write gap (14.9x) is interpreter overhead plus one syscall per record;
-the hit-read gap (9.1x) is per-record decoding in Python.
+The write gap (14.8x) is interpreter overhead plus one syscall per record.
+The read gap is now 2.1-2.3x, and its remaining cost is per-record decoding
+in Python plus the bloom and range checks per segment.
 
-Two rows deserve a note.  **Point-read misses are at parity (1.1x)**
-because a segment whose recorded key range does not contain the probe is
-rejected with two byte comparisons, before any bloom filter or file
-access.  **A full scan is only 2.7x slower** because both engines stream,
-and minikv pays one `crc32()` per 4 KiB block rather than per record.
+Three rows deserve a note.  **A warm point read is 2.3x** because a 4 KiB
+block holds ~34 records, so one disk read serves ~34 lookups and the rest
+are a bisect over an in-memory tuple.  **A point-read miss is 1.5x**,
+slower than the 1.1x of v1.2: a segment whose recorded key range cannot
+contain the probe is still rejected with two byte comparisons, but every
+read now also takes a snapshot lease (two lock operations) so that
+compaction cannot delete the files under it.  **A full scan is 2.9x**
+because both engines stream, and minikv pays one `crc32()` per 4 KiB block
+rather than per record.
 
 ## Optimization 1 (v1.0): caching segment file handles
 
@@ -156,6 +174,76 @@ chunks instead of reading the file whole: recovery must no longer hold an
 entire WAL in memory, which the earlier code did.  It is 0.9 ms on this
 workload, and it removes an unbounded-memory failure mode.
 
+## Optimization 3 (v1.3): point reads -- stop at the key, then cache the block
+
+### The profile
+
+After v1.2 a hit cost 11.6 us (0.058 s for 5 000 reads), and the first two
+rounds had already removed the obvious waste: only 9 `open()` calls
+remained, and the snapshot lease cost 3 ms in total.  The profile was
+therefore about decoding:
+
+```
+ncalls  tottime  cumtime  function
+  5000    0.003    0.123  engine.py:423(get)
+ 23265    0.032    0.109  segment.py:347(get)
+ 82782    0.035    0.042  encoding.py:198(decode_sst_record)   <-- 34%
+  4653    0.003    0.011  segment.py:325(_read_block)
+```
+
+82 782 record decodes for 5 000 gets -- 16.6 per lookup.  That is the
+linear walk inside a block: a 4 KiB block holds ~34 records, and the old
+code decoded every record completely -- key *and* 100-byte value -- to
+compare keys it was going to skip.  The bloom filter and the key range
+were already doing their job; the waste was inside the block.
+
+### Change 1: stop at the key
+
+A record is `klen | tombstone | vlen | key | value`, so the key comes
+first.  `get()` now unpacks the header, compares the key, and only touches
+the value when the key matches.  A skipped record costs a header unpack
+and one slice instead of a full decode with its value copy.
+
+### Change 2: cache decoded blocks
+
+`BlockCache` holds decoded blocks as `(keys, entries)` tuples in a bounded
+LRU, so a lookup inside a warm block is a bisect over an in-memory tuple.
+It is populated only from bytes that already passed their CRC: a cache of
+*verified* data, not a replacement for verification -- the opposite of
+trusting an mmap.
+
+Each row is one `bench.py` run, so both are reproducible with a single
+command:
+
+| | point read, hit | point read, hot set | scan repeated 5x |
+| --- | --- | --- | --- |
+| cache off (`--block-cache-bytes 0`) | 0.0463 s (7.1x) | 0.0483 s (7.2x) | 0.0249 s (2.3x) |
+| cache 8 MiB (the default) | 0.0147 s (2.3x) | 0.0122 s (2.1x) | 0.0159 s (1.5x) |
+| speedup | 3.1x | 4.0x | 1.6x |
+
+### The result
+
+| Scenario | v1.2 | v1.3 | change |
+| --- | --- | --- | --- |
+| point read, hit | 0.058 s (9.1x) | 0.015 s (2.3x) | 4.0x faster |
+| point read, hot set | not measured | 0.012 s (2.1x) | -- |
+| full scan, repeated 5x | not measured | 0.016 s (1.5x) | -- |
+| point read, miss | 0.004 s (1.1x) | 0.006 s (1.5x) | slower, deliberately |
+
+The miss row got worse, and the reason is honest: the snapshot lease that
+makes reclamation safe costs about 0.3 us per read, and a miss is the
+cheapest read there is.  It buys the guarantee that compaction cannot
+delete a segment while a reader holds it.
+
+### A change that was measured and reverted
+
+The first version routed `items()` -- the sequential iterator used by
+compaction -- through the same cache.  Compaction went from 0.0265 s to
+0.069 s, because merging 76 segments pushed every block through the cache
+and evicted the working set for no benefit.  Full sequential scans now
+bypass the cache deliberately, and the measurement is quoted in the
+method's docstring.
+
 ## Batching: where one fsync per batch stops paying
 
 With `sync="always"` every single `put` pays its own fsync (~250 us
@@ -201,9 +289,16 @@ goes flat.
 - **One syscall per record.** Buffering the WAL would remove it, but it
   would also break the documented promise that `sync="never"` survives a
   process kill, because buffered bytes never reached the kernel.
-- **Per-record Python objects.** Decoding is the reason hit reads are 9x
-  slower than SQLite; a C extension is out of scope by the project's
-  constraints.
+- **Per-record Python objects.** Decoding is the remaining reason hit
+  reads are 2.3x slower than SQLite; a C extension is out of scope by the
+  project's constraints.
+- **The block cache costs memory.** 8 MiB by default, holding ~1 300
+  blocks, which covers the benchmark's whole working set (665 KiB).  A
+  store far larger than the cache will see the hit rate fall, and the miss
+  path is a full block decode.
+- **A snapshot lease on every read.** Two lock operations per `get()`, or
+  about 0.3 us, which is why the miss row is 1.5x rather than 1.1x.  It is
+  the price of deleting retired segment files safely.
 - **Compaction is O(live data).** It rewrites every live byte once per
   pass.  A leveled design would rewrite less.  Out of scope for v1.
 - **Reverse scans decode a block forward, then walk it backwards**, which
@@ -218,8 +313,12 @@ goes flat.
 - `benchmarks/measure_batch.py` -- the batch-size sweep (writes
   `batch-curve-<stamp>.json`).
 - `benchmarks/profile_reads.py`, `benchmarks/profile_writes.py` -- cProfile runs.
-- `benchmarks/results/bench-20261024T123521.json` -- canonical run (v1.1).
-- `benchmarks/results/bench-20261024T123518.json` -- repeat run.
+- `benchmarks/results/bench-20261024T150821.json` -- canonical run (v1.3).
+- `benchmarks/results/bench-20261024T150826.json` -- its repeat.
+- `benchmarks/results/bench-20261024T150924.json` -- the same build with the
+  block cache off, quoted in optimization 3.
+- `benchmarks/results/bench-20261024T123521.json` -- v1.1 run quoted above.
+- `benchmarks/results/bench-20261024T123518.json` -- its repeat.
 - `benchmarks/results/bench-20261024T114414.json` -- v1.0 run quoted above.
 - `benchmarks/results/batch-curve-20261024T142842.json` -- the sweep above.
 - `benchmarks/results/profile-reads.txt`, `profile-writes.txt` -- raw cProfile output.

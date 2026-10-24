@@ -11,8 +11,8 @@ Three results this repository reproduces on one machine:
 
 - **~34x from batching**: 50 writes per `batch()` under `sync="always"`
   cost 7.7 us/op against 258 us/op for single puts -- one fsync, not fifty.
-- **A miss costs nothing**: 0.004 s for 5 000 point-read misses, down from
-  0.042 s and level with SQLite, once segments recorded their key range.
+- **A warm read is 2.3x from SQLite**: 0.015 s for 5 000 point reads, down
+  from 0.058 s, because one 4 KiB block serves ~34 lookups.
 - **Nothing acknowledged is lost**: 0 losses across 140 crash points.
 
 ```python
@@ -82,13 +82,13 @@ durable as NTFS itself: `stats()` reports `fsync_dir_supported: False`.
 
 | Scenario | minikv | sqlite3 | minikv slower |
 | --- | --- | --- | --- |
-| sequential write | 0.082 s | 0.006 s | 14.9x |
-| random write | 0.111 s | 0.006 s | 18.2x |
-| point read, hit | 0.058 s | 0.006 s | 9.1x |
-| point read, miss | 0.004 s | 0.004 s | 1.1x |
-| full scan | 0.006 s | 0.002 s | 2.7x |
-| restart, 5 000 WAL records | 0.008 s | 0.001 s | 10.9x |
-| compaction, 76 segments | 0.026 s | not applicable | -- |
+| sequential write | 0.081 s | 0.006 s | 14.8x |
+| point read, hit | 0.015 s | 0.007 s | 2.3x |
+| point read, hot set | 0.012 s | 0.006 s | 2.1x |
+| point read, miss | 0.006 s | 0.004 s | 1.5x |
+| full scan | 0.006 s | 0.002 s | 2.9x |
+| restart, 5 000 WAL records | 0.008 s | 0.001 s | 8.2x |
+| compaction, 76 segments | 0.074 s | merge alone: 0.026 s | -- |
 
 SQLite is a C library with a page cache and years of tuning; the remaining
 gap is the interpreter, one Python object per record and one syscall each.
@@ -104,7 +104,7 @@ gap is the interpreter, one Python object per record and one syscall each.
 
 - DESIGN.md -- why an LSM tree, fsync costs, the concurrency model and the
   trade-offs, each with measurements.
-- BENCHMARKS.md -- method, numbers, the two optimization cycles.
+- BENCHMARKS.md -- method, numbers, three optimization cycles.
 - docs/crash-consistency.md -- invariants, fault model, injection method.
 - CONTRIBUTING.md, SECURITY.md, CHANGELOG.md
 

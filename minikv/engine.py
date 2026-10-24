@@ -67,7 +67,7 @@ from .encoding import (
 from .errors import ClosedStoreError, CorruptRecordError, StoreLockedError
 from .faults import fault_point
 from .memtable import TOMBSTONE, MemTable
-from .segment import DEFAULT_BLOCK_BYTES, SegmentReader, fsync_dir, write_segment
+from .segment import DEFAULT_BLOCK_BYTES, BlockCache, SegmentReader, fsync_dir, write_segment
 from .wal import SYNC_MODES, WAL, IntervalSyncer, warn_corruption
 
 MANIFEST_NAME = "MANIFEST"
@@ -166,6 +166,7 @@ class Store:
         memtable_bytes: int = 4 << 20,
         block_bytes: int = DEFAULT_BLOCK_BYTES,
         wal_sync_interval_ms: int = 100,
+        block_cache_bytes: int = 8 << 20,
     ) -> None:
         if sync not in SYNC_MODES:
             raise ValueError(f"sync must be one of {SYNC_MODES}, got {sync!r}")
@@ -176,6 +177,12 @@ class Store:
         self.memtable_bytes = int(memtable_bytes)
         self.block_bytes = int(block_bytes)
         self.wal_sync_interval_ms = int(wal_sync_interval_ms)
+        # Decoded, CRC-verified blocks.  A 4 KiB block holds ~34 records, so
+        # one disk read serves ~34 point reads; BENCHMARKS.md measures it at
+        # 3.2x on a full sweep and 4.0x on a hot working set.  Set 0 to
+        # disable, for example when measuring cold reads.
+        self.block_cache_bytes = int(block_cache_bytes)
+        self._block_cache = BlockCache(self.block_cache_bytes) if self.block_cache_bytes else None
 
         os.makedirs(self.path, exist_ok=True)
         self._lock = threading.RLock()
@@ -305,7 +312,7 @@ class Store:
             with contextlib.suppress(OSError):
                 os.unlink(os.path.join(self.path, stale))
 
-        readers = [SegmentReader(os.path.join(self.path, name)) for name in names]
+        readers = [SegmentReader(os.path.join(self.path, name), self._block_cache) for name in names]
         self._segments = tuple(readers)
         self._write_manifest()
         return readers
@@ -399,7 +406,7 @@ class Store:
                 segment_path = self._segment_path(seq)
                 try:
                     write_segment(segment_path, frozen.items_sorted(), len(frozen), self.block_bytes)
-                    reader = SegmentReader(segment_path)
+                    reader = SegmentReader(segment_path, self._block_cache)
                 except BaseException:
                     with self._lock:
                         self._pending.insert(0, (frozen, wal_paths))
@@ -641,7 +648,7 @@ class Store:
             output = self._segment_path(seq)
             try:
                 merge_segments(readers, output, self.block_bytes)
-                merged = SegmentReader(output)
+                merged = SegmentReader(output, self._block_cache)
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.unlink(output)
@@ -664,12 +671,18 @@ class Store:
                 fault_point("compaction_merged")
                 self._write_manifest()
                 fault_point("compaction_manifest")
-                self._reclaim(self._drain_retired_locked())
-                return {
+                pending = self._drain_retired_locked()
+                result = {
                     "segments_merged": len(readers),
                     "segments_after": len(self._segments),
                     "entries": merged.num_entries,
                 }
+            # Unlinking the inputs measured ~275 us per file on Windows, so it
+            # happens outside the writer lock: any reader that could still
+            # reference these segments already held a lease when the list was
+            # drained, and a reader that arrives later sees the new snapshot.
+            self._reclaim(pending)
+            return result
         finally:
             self._compact_lock.release()
 
@@ -743,6 +756,8 @@ class Store:
             "pending_flushes": len(self._pending),
             "deferred_deletes": len(self._retired),
             "live_snapshots": self._live_snapshots,
+            "block_cache_bytes": self.block_cache_bytes,
+            "block_cache_used": self._block_cache.used_bytes if self._block_cache else 0,
             "corruption_events": self._corruption_events,
             "fsync_dir_supported": os.name != "nt",
         }
